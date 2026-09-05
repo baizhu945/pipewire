@@ -99,6 +99,8 @@ if get_option('spa-plugins').allowed()
 
     aptx_dep = dependency('libfreeaptx', required : get_option('bluez5-codec-aptx'))
     summary({'aptX': aptx_dep.found()}, bool_yn: true, section: 'Bluetooth audio codecs')
+    aptx_adaptive_dep = dependency('openaptx', required : get_option('bluez5-codec-aptx-adaptive'))
+    summary({'aptX Adaptive protocol': aptx_adaptive_dep.found()}, bool_yn: true, section: 'Bluetooth audio codecs')
     fdk_aac_dep = dependency('fdk-aac', required : get_option('bluez5-codec-aac'))
     summary({'AAC': fdk_aac_dep.found()}, bool_yn: true, section: 'Bluetooth audio codecs')
     lc3plus_dep = dependency('lc3plus', required : false)

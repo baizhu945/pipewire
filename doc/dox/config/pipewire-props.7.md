@@ -1195,7 +1195,8 @@ Enabled A2DP codecs (default: all).  Possible values: `sbc`, `sbc_xq`,
 `aac`, `aac_eld`, `aptx`, `aptx_hd`, `aptx_ll`, `aptx_ll_duplex`,
 `faststream`, `faststream_duplex`, `lc3plus_h3`, `ldac`, `opus_05`,
 `opus_05_51`, `opus_05_71`, `opus_05_duplex`, `opus_05_pro`, `opus_g`,
-`lc3`.
+`lc3`, `aptx_adaptive`. The `aptx_adaptive` entry is experimental and is
+available only when PipeWire is built with the external encoder bridge.
 
 @PAR@ monitor-prop  bluez5.default.rate   # integer
 Default audio rate.

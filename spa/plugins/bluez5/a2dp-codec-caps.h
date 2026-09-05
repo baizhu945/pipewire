@@ -167,6 +167,24 @@
 #define APTX_HD_SAMPLING_FREQ_44100     0x2
 #define APTX_HD_SAMPLING_FREQ_48000     0x1
 
+/* aptX Adaptive vendor-specific codec information.  The 40-byte codec
+ * information element is the layout used by Qualcomm's A2DP implementation:
+ * vendor/codec IDs, frequency and channel masks, six TTP bytes, three EOC
+ * bytes, and 23 reserved bytes. */
+#define APTX_ADAPTIVE_VENDOR_ID          0x000000d7
+#define APTX_ADAPTIVE_CODEC_ID           0x00ad
+
+#define APTX_ADAPTIVE_SAMPLING_FREQ_44100  0x08
+#define APTX_ADAPTIVE_SAMPLING_FREQ_48000  0x10
+#define APTX_ADAPTIVE_SAMPLING_FREQ_88000  0x20
+#define APTX_ADAPTIVE_SAMPLING_FREQ_192000 0x40
+
+#define APTX_ADAPTIVE_CHANNEL_MODE_MONO         0x01
+#define APTX_ADAPTIVE_CHANNEL_MODE_STEREO       0x02
+#define APTX_ADAPTIVE_CHANNEL_MODE_TWS_STEREO   0x04
+#define APTX_ADAPTIVE_CHANNEL_MODE_JOINT_STEREO 0x08
+#define APTX_ADAPTIVE_CHANNEL_MODE_TWS_MONO     0x10
+
 #define APTX_LL_VENDOR_ID		0x0000000a
 #define APTX_LL_VENDOR_ID2		0x000000d7
 #define APTX_LL_CODEC_ID		0x0002
@@ -401,6 +419,15 @@ typedef struct {
 } __attribute__ ((packed)) a2dp_aptx_hd_t;
 
 typedef struct {
+	a2dp_vendor_codec_t info;
+	uint8_t sampling_freq;
+	uint8_t channel_mode;
+	uint8_t ttp[6];
+	uint8_t eoc[3];
+	uint8_t reserved[23];
+} __attribute__ ((packed)) a2dp_aptx_adaptive_t;
+
+typedef struct {
         a2dp_aptx_t aptx;
         uint8_t bidirect_link:1;
         uint8_t has_new_caps:1;
@@ -459,6 +486,15 @@ typedef struct {
 	uint8_t channel_mode:4;
 	uint32_t rfa;
 } __attribute__ ((packed)) a2dp_aptx_hd_t;
+
+typedef struct {
+	a2dp_vendor_codec_t info;
+	uint8_t sampling_freq;
+	uint8_t channel_mode;
+	uint8_t ttp[6];
+	uint8_t eoc[3];
+	uint8_t reserved[23];
+} __attribute__ ((packed)) a2dp_aptx_adaptive_t;
 
 typedef struct {
         a2dp_aptx_t aptx;

@@ -34,6 +34,7 @@ static int codec_order(const struct media_codec *c)
 		SPA_BLUETOOTH_AUDIO_CODEC_LC3,
 		SPA_BLUETOOTH_AUDIO_CODEC_LHDC_V5,
 		SPA_BLUETOOTH_AUDIO_CODEC_LDAC,
+		SPA_BLUETOOTH_AUDIO_CODEC_APTX_ADAPTIVE,
 		SPA_BLUETOOTH_AUDIO_CODEC_APTX_HD,
 		SPA_BLUETOOTH_AUDIO_CODEC_APTX,
 		SPA_BLUETOOTH_AUDIO_CODEC_AAC,
@@ -185,6 +186,7 @@ const struct media_codec * const *load_media_codecs(struct spa_plugin_loader *lo
 		{ MEDIA_CODEC_FACTORY_NAME(basename), MEDIA_CODEC_LIB_BASE basename }
 		MEDIA_CODEC_FACTORY_LIB("aac"),
 		MEDIA_CODEC_FACTORY_LIB("aptx"),
+		MEDIA_CODEC_FACTORY_LIB("aptx-adaptive"),
 		MEDIA_CODEC_FACTORY_LIB("faststream"),
 		MEDIA_CODEC_FACTORY_LIB("lhdc"),
 		MEDIA_CODEC_FACTORY_LIB("ldac"),

@@ -134,6 +134,16 @@ if aptx_dep.found()
     install_dir : spa_plugindir / 'bluez5')
 endif
 
+if get_option('bluez5-codec-aptx-adaptive').allowed() and aptx_adaptive_dep.found()
+  bluez_codec_aptx_adaptive = shared_library('spa-codec-bluez5-aptx-adaptive',
+    [ 'a2dp-codec-aptx-adaptive.c', 'media-codecs.c' ],
+    include_directories : [ configinc ],
+    c_args : codec_args,
+    dependencies : [ spa_dep, aptx_adaptive_dep ],
+    install : true,
+    install_dir : spa_plugindir / 'bluez5')
+endif
+
 if ldac_dep.found()
   ldac_args = codec_args
   if ldac_abr_dep.found()
