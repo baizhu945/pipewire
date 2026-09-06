@@ -33,14 +33,19 @@
 #define APTX_ADAPTIVE_SYSROOT_ENV "PIPEWIRE_APTX_ADAPTIVE_SYSROOT"
 #define APTX_ADAPTIVE_MODE_ENV "PIPEWIRE_APTX_ADAPTIVE_MODE"
 #define APTX_ADAPTIVE_PROFILE_ENV "APTX_ADAPTIVE_PROFILE"
+#define APTX_ADAPTIVE_STREAM_ENV "APTX_ADAPTIVE_CONFIG_STREAM_HEX"
+#define APTX_ADAPTIVE_LOSSLESS_ENV "APTX_ADAPTIVE_LOSSLESS"
+#define APTX_ADAPTIVE_QHS_ENV "APTX_ADAPTIVE_QHS_SUPPORT"
+#define APTX_ADAPTIVE_ABR_ENV "APTX_ADAPTIVE_ABR"
 
 #define APTX_ADAPTIVE_CHANNELS 2u
-#define APTX_ADAPTIVE_BITS_PER_SAMPLE 32u
+#define APTX_ADAPTIVE_HELPER_BITS_PER_SAMPLE 32u
 #define APTX_ADAPTIVE_CODEC_FRAMES 672u
 #define APTX_ADAPTIVE_CODEC_BYTES \
-	(APTX_ADAPTIVE_CHANNELS * (APTX_ADAPTIVE_BITS_PER_SAMPLE / 8u) * \
+	(APTX_ADAPTIVE_CHANNELS * (APTX_ADAPTIVE_HELPER_BITS_PER_SAMPLE / 8u) * \
 	 APTX_ADAPTIVE_CODEC_FRAMES)
 #define APTX_ADAPTIVE_MAX_PACKET_SIZE 4096u
+#define APTX_ADAPTIVE_MAX_SOURCE_FRAMES (APTX_ADAPTIVE_CODEC_FRAMES * 2u)
 
 #define APTX_ADAPTIVE_ABR_LEVELS 5u
 #define APTX_ADAPTIVE_ABR_CONFIRMATIONS 3u
@@ -69,10 +74,6 @@ static const struct adaptive_rate adaptive_rates[] = {
 	{ 192000, 96000, APTX_ADAPTIVE_SAMPLING_FREQ_96000 },
 };
 
-static const uint32_t adaptive_bitrates[APTX_ADAPTIVE_ABR_LEVELS] = {
-	279000, 320000, 352000, 384000, 420000,
-};
-
 SPA_STATIC_ASSERT(sizeof(a2dp_aptx_adaptive_t) == 40);
 
 struct impl {
@@ -88,9 +89,14 @@ struct impl {
 	enum aptx_adaptive_helper_mode mode;
 	uint32_t profile;
 	bool downsample2;
+	bool input_s16;
+	uint32_t source_bytes;
+	enum aptx_adaptive_helper_lossless_mode lossless_mode;
+	bool qhs_supported;
 
 	int32_t downsample_history[APTX_ADAPTIVE_CHANNELS]
 		[APTX_ADAPTIVE_DOWNSAMPLE_HISTORY];
+	int32_t source_pcm[APTX_ADAPTIVE_MAX_SOURCE_FRAMES * APTX_ADAPTIVE_CHANNELS];
 	int32_t codec_pcm[APTX_ADAPTIVE_CODEC_FRAMES * APTX_ADAPTIVE_CHANNELS];
 	uint8_t packet[APTX_ADAPTIVE_MAX_PACKET_SIZE];
 
@@ -119,9 +125,9 @@ static enum aptx_adaptive_helper_mode get_helper_mode(uint32_t source_rate)
 			return APTX_ADAPTIVE_HELPER_MODE_R3;
 	}
 
-	/* Let the helper try R3 for the verified 48 kHz profile and fall back to
-	 * R2 when it is unavailable.  For every other graph rate the helper's
-	 * automatic path selects R2 because this R3 blob is 48 kHz only. */
+	/* The helper's automatic path uses the R2 CAPI wrapper.  That wrapper is
+	 * the only available entry point that can carry the 2.2 capability stream,
+	 * AudioReach ABR feedback, and the 44.1 kHz Lossless state machine. */
 	(void)source_rate;
 	return APTX_ADAPTIVE_HELPER_MODE_AUTO;
 }
@@ -130,6 +136,36 @@ static uint32_t get_profile(void)
 {
 	const char *value = getenv(APTX_ADAPTIVE_PROFILE_ENV);
 	return value == NULL ? 6u : (uint32_t)strtoul(value, NULL, 0);
+}
+
+static enum aptx_adaptive_helper_lossless_mode get_lossless_mode(void)
+{
+	const char *value = getenv(APTX_ADAPTIVE_LOSSLESS_ENV);
+
+	if (value == NULL || spa_streq(value, "auto") || spa_streq(value, "AUTO"))
+		return APTX_ADAPTIVE_HELPER_LOSSLESS_AUTO;
+	if (spa_streq(value, "force") || spa_streq(value, "FORCE"))
+		return APTX_ADAPTIVE_HELPER_LOSSLESS_FORCE;
+	return APTX_ADAPTIVE_HELPER_LOSSLESS_OFF;
+}
+
+static bool get_qhs_supported(void)
+{
+	const char *value = getenv(APTX_ADAPTIVE_QHS_ENV);
+
+	/* An ordinary host Bluetooth controller does not expose Qualcomm High
+	 * Speed Link.  Require an explicit assertion before AUTO may enter the
+	 * vendor Lossless candidate path. */
+	return value != NULL && (spa_streq(value, "1") ||
+			spa_streq(value, "yes") || spa_streq(value, "true") ||
+			spa_streq(value, "YES") || spa_streq(value, "TRUE"));
+}
+
+static bool get_abr_enabled(void)
+{
+	const char *value = getenv(APTX_ADAPTIVE_ABR_ENV);
+	return value == NULL || (!spa_streq(value, "0") &&
+			!spa_streq(value, "off") && !spa_streq(value, "OFF"));
 }
 
 static bool helper_available(void)
@@ -300,12 +336,38 @@ static int helper_control(struct impl *this, uint32_t command,
 		(status == 0 ? -EPROTO : -(int)status);
 }
 
-static void init_r2_stream(uint8_t stream[APTX_ADAPTIVE_HELPER_R2_STREAM_SIZE])
+static int hex_value(char value)
+{
+	if (value >= '0' && value <= '9')
+		return value - '0';
+	if (value >= 'a' && value <= 'f')
+		return value - 'a' + 10;
+	if (value >= 'A' && value <= 'F')
+		return value - 'A' + 10;
+	return -1;
+}
+
+static int init_r2_stream(uint8_t stream[APTX_ADAPTIVE_HELPER_R2_STREAM_SIZE])
 {
 	static const uint8_t default_stream[APTX_ADAPTIVE_HELPER_R2_STREAM_SIZE] = {
 		1, 151, 0, 0, 15, 2, 3, 3, 3, 0, 170,
 	};
+	const char *value = getenv(APTX_ADAPTIVE_STREAM_ENV);
+
+	if (value != NULL) {
+		if (strlen(value) != APTX_ADAPTIVE_HELPER_R2_STREAM_SIZE * 2u)
+			return -EINVAL;
+		for (size_t i = 0; i < APTX_ADAPTIVE_HELPER_R2_STREAM_SIZE; ++i) {
+			int high = hex_value(value[i * 2]);
+			int low = hex_value(value[i * 2 + 1]);
+			if (high < 0 || low < 0)
+				return -EINVAL;
+			stream[i] = (uint8_t)((high << 4) | low);
+		}
+		return 0;
+	}
 	memcpy(stream, default_stream, sizeof(default_stream));
+	return 0;
 }
 
 static int initialize_helper(struct impl *this, const uint8_t *codec_config,
@@ -321,11 +383,15 @@ static int initialize_helper(struct impl *this, const uint8_t *codec_config,
 	config.mode = this->mode;
 	config.profile = this->profile;
 	config.mtu = this->mtu > 0 ? (uint32_t)this->mtu : 995u;
-	config.abr_enabled = 1;
+	config.abr_enabled = this->abr_enabled ? 1u : 0u;
+	config.bits_per_sample = this->input_s16 ? 16u : 32u;
+	config.lossless_mode = this->lossless_mode;
+	config.qhs_supported = this->qhs_supported ? 1u : 0u;
 	config.cie_size = APTX_ADAPTIVE_HELPER_CIE_SIZE;
 	memcpy(config.cie, codec_config,
 			SPA_MIN(codec_config_size, sizeof(config.cie)));
-	init_r2_stream(config.r2_stream);
+	if ((result = init_r2_stream(config.r2_stream)) < 0)
+		return result;
 
 	if ((result = read_full(this->output_fd, ready, sizeof(ready))) < 0)
 		return result;
@@ -336,12 +402,6 @@ static int initialize_helper(struct impl *this, const uint8_t *codec_config,
 				&config, sizeof(config))) < 0)
 		return result;
 
-	/* Start at the highest Adaptive quality level. */
-	if ((result = helper_control(this,
-			APTX_ADAPTIVE_HELPER_COMMAND_SET_BITRATE,
-			&adaptive_bitrates[APTX_ADAPTIVE_ABR_LEVELS - 1],
-			sizeof(adaptive_bitrates[0]))) < 0)
-		return result;
 	return 0;
 }
 
@@ -449,6 +509,9 @@ static int codec_select_config(const struct media_codec *codec, uint32_t flags,
 		conf.channel_mode = APTX_ADAPTIVE_CHANNEL_MODE_STEREO;
 	else
 		return -ENOTSUP;
+	if (info != NULL && info->channels != 0 &&
+			info->channels != APTX_ADAPTIVE_CHANNELS)
+		return -ENOTSUP;
 
 	memcpy(config, &conf, sizeof(conf));
 	return sizeof(conf);
@@ -476,7 +539,13 @@ static int codec_enum_config(const struct media_codec *codec, uint32_t flags,
 	spa_pod_builder_add(b,
 			SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_audio),
 			SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-			SPA_FORMAT_AUDIO_format, SPA_POD_Id(SPA_AUDIO_FORMAT_S32),
+			/* S16 is listed first so 44.1 kHz can preserve the exact sample
+			 * word required by the Lossless candidate.  S32 remains available
+			 * for ordinary Adaptive/high-resolution streams. */
+			SPA_FORMAT_AUDIO_format, SPA_POD_CHOICE_ENUM_Id(3,
+					SPA_AUDIO_FORMAT_S16,
+					SPA_AUDIO_FORMAT_S16,
+					SPA_AUDIO_FORMAT_S32),
 			SPA_FORMAT_AUDIO_channels, SPA_POD_Int(APTX_ADAPTIVE_CHANNELS),
 			SPA_FORMAT_AUDIO_position, SPA_POD_Array(sizeof(uint32_t),
 					SPA_TYPE_Id, SPA_N_ELEMENTS(position), position),
@@ -525,7 +594,8 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 	if (config == NULL || config_len < sizeof(a2dp_aptx_adaptive_t) ||
 			info == NULL || info->media_type != SPA_MEDIA_TYPE_audio ||
 			info->media_subtype != SPA_MEDIA_SUBTYPE_raw ||
-			info->info.raw.format != SPA_AUDIO_FORMAT_S32 ||
+				(info->info.raw.format != SPA_AUDIO_FORMAT_S16 &&
+					info->info.raw.format != SPA_AUDIO_FORMAT_S32) ||
 			info->info.raw.channels != APTX_ADAPTIVE_CHANNELS ||
 			!helper_available()) {
 		errno = ENOTSUP;
@@ -549,17 +619,22 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 	this->codec_rate = rate->codec_rate;
 	this->source_frames = APTX_ADAPTIVE_CODEC_FRAMES *
 			(source_rate == rate->codec_rate ? 1u : 2u);
-	this->block_size = (int)(this->source_frames * APTX_ADAPTIVE_CHANNELS *
-			(APTX_ADAPTIVE_BITS_PER_SAMPLE / 8u));
 	this->mtu = mtu > 0 ? (int)mtu : 995;
 	this->mode = get_helper_mode(source_rate);
 	this->profile = get_profile();
 	this->downsample2 = source_rate != rate->codec_rate;
-	this->abr_enabled = true;
+	this->input_s16 = info->info.raw.format == SPA_AUDIO_FORMAT_S16;
+	this->source_bytes = this->input_s16 ? sizeof(int16_t) : sizeof(int32_t);
+	this->lossless_mode = get_lossless_mode();
+	this->qhs_supported = get_qhs_supported();
+	this->abr_enabled = get_abr_enabled();
+	this->block_size = (int)(this->source_frames * APTX_ADAPTIVE_CHANNELS *
+			this->source_bytes);
 	this->abr_level = APTX_ADAPTIVE_ABR_LEVELS - 1;
 	this->abr_pending_level = this->abr_level;
 
-	if (this->mode == APTX_ADAPTIVE_HELPER_MODE_R3 && source_rate != 48000)
+	if (this->mode == APTX_ADAPTIVE_HELPER_MODE_R3 &&
+			(source_rate != 48000 || this->input_s16))
 		goto error;
 	this->pid = spawn_helper(&this->input_fd, &this->output_fd);
 	if (this->pid < 0)
@@ -611,27 +686,61 @@ static int codec_encode(void *data, const void *src, size_t src_size,
 	if (dst_size == 0)
 		return -ENOSPC;
 
+	if (this->input_s16) {
+		const int16_t *samples = src;
+		size_t sample_count = (size_t)this->source_frames *
+				APTX_ADAPTIVE_CHANNELS;
+
+		/* The Qualcomm CAPI input is a signed S32/Q27 stream.  Multiplication
+		 * by 2^12 widens a signed 16-bit source exactly, without discarding
+		 * any source bit; the source word size is also sent in the helper's
+		 * Lossless feedback configuration. */
+		for (size_t i = 0; i < sample_count; ++i)
+			this->source_pcm[i] = (int32_t)samples[i] * (1 << 12);
+		helper_src = this->source_pcm;
+	}
 	if (this->downsample2) {
-		downsample2(this, src);
+		downsample2(this, helper_src);
 		helper_src = this->codec_pcm;
 	}
-	write_u32le(request_size, APTX_ADAPTIVE_CODEC_BYTES);
+	/* The helper's CAPI boundary is always S32/Q27, including widened S16
+	 * source audio. */
+	const size_t helper_bytes = APTX_ADAPTIVE_CODEC_BYTES;
+	write_u32le(request_size, (uint32_t)helper_bytes);
 	if ((result = write_full(this->input_fd, request_size, sizeof(request_size))) < 0 ||
 			(result = write_full(this->input_fd, helper_src,
-				APTX_ADAPTIVE_CODEC_BYTES)) < 0 ||
+				helper_bytes)) < 0 ||
 			(result = read_full(this->output_fd, response, sizeof(response))) < 0)
 		return result;
 
 	uint32_t response_status = read_u32le(response);
 	uint32_t response_size = read_u32le(response + 4);
-	if (response_status != 0 || response_size == 0 ||
-			response_size > sizeof(this->packet))
-		return response_status == 0 ? -EAGAIN : -EIO;
+	if (response_status != 0) {
+		/* CAPI encoders buffer several input calls before their first
+		 * complete OTA packet.  The helper reports that as EAGAIN; the
+		 * input block has still been consumed and must not be replayed. */
+		if (response_status == EAGAIN) {
+			*dst_out = 0;
+			*need_flush = NEED_FLUSH_NO;
+			return this->block_size;
+		}
+		return -EIO;
+	}
+	if (response_size == 0 || response_size > sizeof(this->packet)) {
+		*dst_out = 0;
+		*need_flush = NEED_FLUSH_NO;
+		return this->block_size;
+	}
 	if ((result = read_full(this->output_fd, this->packet, response_size)) < 0)
 		return result;
 	if (aptx_adaptive_next_ota_packet(this->packet, response_size, &header,
 			&payload, &consumed) < 0 || consumed != response_size)
 		return -EBADMSG;
+	/* A2DP sends one complete vendor packet per transport write.  Adaptive
+	 * OTA has no generic PipeWire fragmentation marker, so never hand a
+	 * packet larger than the negotiated L2CAP MTU to spa_bt_send(). */
+	if (this->mtu > 0 && response_size > (size_t)this->mtu)
+		return -EMSGSIZE;
 	if (response_size > dst_size)
 		return -ENOSPC;
 
@@ -661,6 +770,7 @@ static int codec_abr_process(void *data, size_t unsent)
 {
 	struct impl *this = data;
 	unsigned int target;
+	uint32_t quality_level;
 	int result;
 
 	if (!this->abr_enabled)
@@ -680,8 +790,14 @@ static int codec_abr_process(void *data, size_t unsent)
 	if (++this->abr_pending_count < APTX_ADAPTIVE_ABR_CONFIRMATIONS)
 		return 0;
 
-	result = helper_control(this, APTX_ADAPTIVE_HELPER_COMMAND_SET_BITRATE,
-			&adaptive_bitrates[target], sizeof(adaptive_bitrates[0]));
+	/* The socket queue is only a local fallback signal; AX210/BlueZ does not
+	 * expose the Qualcomm RF/BER/QHS feedback used by the official stack.  At
+	 * least send the result through the official quality-level control plane,
+	 * rather than bypassing it with a direct encoder bitrate setter. */
+	quality_level = target + 1u;
+	result = helper_control(this,
+			APTX_ADAPTIVE_HELPER_COMMAND_SET_QUALITY_LEVEL,
+			&quality_level, sizeof(quality_level));
 	if (result == 0) {
 		this->abr_level = target;
 		this->abr_pending_count = 0;
