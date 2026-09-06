@@ -5,6 +5,8 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
@@ -21,21 +23,55 @@
 #include "media-codecs.h"
 
 /*
- * This bridge is deliberately opt-in at runtime.  PipeWire's real-time
- * thread talks to a long-lived helper over two pipes; the helper is expected
- * to be a user-supplied Hexagon/QEMU process containing a licensed Qualcomm
- * encoder.  No proprietary library is linked into this plugin.
+ * This bridge is opt-in at runtime.  PipeWire talks to a long-lived helper
+ * over two pipes; the helper is expected to contain a user-supplied,
+ * licensed Qualcomm Hexagon encoder.  No proprietary library is linked into
+ * this plugin.
  */
 #define APTX_ADAPTIVE_HELPER_ENV "PIPEWIRE_APTX_ADAPTIVE_HELPER"
 #define APTX_ADAPTIVE_QEMU_ENV "PIPEWIRE_APTX_ADAPTIVE_QEMU"
 #define APTX_ADAPTIVE_SYSROOT_ENV "PIPEWIRE_APTX_ADAPTIVE_SYSROOT"
+#define APTX_ADAPTIVE_MODE_ENV "PIPEWIRE_APTX_ADAPTIVE_MODE"
+#define APTX_ADAPTIVE_PROFILE_ENV "APTX_ADAPTIVE_PROFILE"
 
-#define APTX_ADAPTIVE_RATE 48000
-#define APTX_ADAPTIVE_CHANNELS 2
-#define APTX_ADAPTIVE_BITS_PER_SAMPLE 32
-#define APTX_ADAPTIVE_BLOCK_SIZE \
-	(APTX_ADAPTIVE_CHANNELS * (APTX_ADAPTIVE_BITS_PER_SAMPLE / 8) * 672)
-#define APTX_ADAPTIVE_MAX_PACKET_SIZE 2048
+#define APTX_ADAPTIVE_CHANNELS 2u
+#define APTX_ADAPTIVE_BITS_PER_SAMPLE 32u
+#define APTX_ADAPTIVE_CODEC_FRAMES 672u
+#define APTX_ADAPTIVE_CODEC_BYTES \
+	(APTX_ADAPTIVE_CHANNELS * (APTX_ADAPTIVE_BITS_PER_SAMPLE / 8u) * \
+	 APTX_ADAPTIVE_CODEC_FRAMES)
+#define APTX_ADAPTIVE_MAX_PACKET_SIZE 4096u
+
+#define APTX_ADAPTIVE_ABR_LEVELS 5u
+#define APTX_ADAPTIVE_ABR_CONFIRMATIONS 3u
+
+/* A causal 2:1 half-band filter.  It is used only for 88.2->44.1 and
+ * 192->96 graph formats, because the available Qualcomm CAPI build accepts
+ * 44.1, 48 and 96 kHz as codec-native input rates. */
+#define APTX_ADAPTIVE_DOWNSAMPLE_TAPS 15u
+#define APTX_ADAPTIVE_DOWNSAMPLE_HISTORY (APTX_ADAPTIVE_DOWNSAMPLE_TAPS - 1u)
+static const int32_t downsample2_coeffs[APTX_ADAPTIVE_DOWNSAMPLE_TAPS] = {
+	0, 188, 0, -1595, 0, 9590, 0, 16384,
+	0, 9590, 0, -1595, 0, 188, 0,
+};
+
+struct adaptive_rate {
+	uint32_t graph_rate;
+	uint32_t codec_rate;
+	uint8_t codec_frequency;
+};
+
+static const struct adaptive_rate adaptive_rates[] = {
+	{ 48000, 48000, APTX_ADAPTIVE_SAMPLING_FREQ_48000 },
+	{ 44100, 44100, APTX_ADAPTIVE_SAMPLING_FREQ_44100 },
+	{ 88200, 44100, APTX_ADAPTIVE_SAMPLING_FREQ_44100 },
+	{ 96000, 96000, APTX_ADAPTIVE_SAMPLING_FREQ_96000 },
+	{ 192000, 96000, APTX_ADAPTIVE_SAMPLING_FREQ_96000 },
+};
+
+static const uint32_t adaptive_bitrates[APTX_ADAPTIVE_ABR_LEVELS] = {
+	279000, 320000, 352000, 384000, 420000,
+};
 
 SPA_STATIC_ASSERT(sizeof(a2dp_aptx_adaptive_t) == 40);
 
@@ -43,8 +79,58 @@ struct impl {
 	pid_t pid;
 	int input_fd;
 	int output_fd;
+
+	uint32_t source_rate;
+	uint32_t codec_rate;
+	uint32_t source_frames;
 	int block_size;
+	int mtu;
+	enum aptx_adaptive_helper_mode mode;
+	uint32_t profile;
+	bool downsample2;
+
+	int32_t downsample_history[APTX_ADAPTIVE_CHANNELS]
+		[APTX_ADAPTIVE_DOWNSAMPLE_HISTORY];
+	int32_t codec_pcm[APTX_ADAPTIVE_CODEC_FRAMES * APTX_ADAPTIVE_CHANNELS];
+	uint8_t packet[APTX_ADAPTIVE_MAX_PACKET_SIZE];
+
+	bool abr_enabled;
+	unsigned int abr_level;
+	unsigned int abr_pending_level;
+	unsigned int abr_pending_count;
 };
+
+static const struct adaptive_rate *find_rate(uint32_t rate)
+{
+	for (size_t i = 0; i < SPA_N_ELEMENTS(adaptive_rates); ++i) {
+		if (adaptive_rates[i].graph_rate == rate)
+			return &adaptive_rates[i];
+	}
+	return NULL;
+}
+
+static enum aptx_adaptive_helper_mode get_helper_mode(uint32_t source_rate)
+{
+	const char *value = getenv(APTX_ADAPTIVE_MODE_ENV);
+	if (value != NULL) {
+		if (spa_streq(value, "r2") || spa_streq(value, "R2"))
+			return APTX_ADAPTIVE_HELPER_MODE_R2;
+		if (spa_streq(value, "r3") || spa_streq(value, "R3"))
+			return APTX_ADAPTIVE_HELPER_MODE_R3;
+	}
+
+	/* Let the helper try R3 for the verified 48 kHz profile and fall back to
+	 * R2 when it is unavailable.  For every other graph rate the helper's
+	 * automatic path selects R2 because this R3 blob is 48 kHz only. */
+	(void)source_rate;
+	return APTX_ADAPTIVE_HELPER_MODE_AUTO;
+}
+
+static uint32_t get_profile(void)
+{
+	const char *value = getenv(APTX_ADAPTIVE_PROFILE_ENV);
+	return value == NULL ? 6u : (uint32_t)strtoul(value, NULL, 0);
+}
 
 static bool helper_available(void)
 {
@@ -66,7 +152,6 @@ static bool helper_available(void)
 static int read_full(int fd, void *data, size_t size)
 {
 	uint8_t *p = data;
-
 	while (size > 0) {
 		ssize_t n = read(fd, p, size);
 		if (n == 0)
@@ -76,7 +161,7 @@ static int read_full(int fd, void *data, size_t size)
 				continue;
 			return -errno;
 		}
-		p += n;
+		p += (size_t)n;
 		size -= (size_t)n;
 	}
 	return 0;
@@ -85,7 +170,6 @@ static int read_full(int fd, void *data, size_t size)
 static int write_full(int fd, const void *data, size_t size)
 {
 	const uint8_t *p = data;
-
 	while (size > 0) {
 		ssize_t n = write(fd, p, size);
 		if (n < 0) {
@@ -95,7 +179,7 @@ static int write_full(int fd, const void *data, size_t size)
 		}
 		if (n == 0)
 			return -EPIPE;
-		p += n;
+		p += (size_t)n;
 		size -= (size_t)n;
 	}
 	return 0;
@@ -105,6 +189,14 @@ static uint32_t read_u32le(const uint8_t data[4])
 {
 	return (uint32_t)data[0] | (uint32_t)data[1] << 8 |
 			(uint32_t)data[2] << 16 | (uint32_t)data[3] << 24;
+}
+
+static void write_u32le(uint8_t data[4], uint32_t value)
+{
+	data[0] = value & 0xff;
+	data[1] = (value >> 8) & 0xff;
+	data[2] = (value >> 16) & 0xff;
+	data[3] = (value >> 24) & 0xff;
 }
 
 static void close_fds(int input_fd, int output_fd)
@@ -185,24 +277,141 @@ static pid_t spawn_helper(int *input_fd, int *output_fd)
 	return pid;
 }
 
+static int helper_control(struct impl *this, uint32_t command,
+		const void *payload, size_t payload_size)
+{
+	uint8_t header[12];
+	uint8_t reply[8];
+	int result;
+
+	if (payload_size > UINT32_MAX)
+		return -EOVERFLOW;
+	write_u32le(header, APTX_ADAPTIVE_HELPER_CONTROL);
+	write_u32le(header + 4, command);
+	write_u32le(header + 8, (uint32_t)payload_size);
+	if ((result = write_full(this->input_fd, header, sizeof(header))) < 0 ||
+			(result = write_full(this->input_fd, payload, payload_size)) < 0 ||
+			(result = read_full(this->output_fd, reply, sizeof(reply))) < 0)
+		return result;
+
+	uint32_t status = read_u32le(reply);
+	uint32_t reply_size = read_u32le(reply + 4);
+	return reply_size == 0 && status == 0 ? 0 :
+		(status == 0 ? -EPROTO : -(int)status);
+}
+
+static void init_r2_stream(uint8_t stream[APTX_ADAPTIVE_HELPER_R2_STREAM_SIZE])
+{
+	static const uint8_t default_stream[APTX_ADAPTIVE_HELPER_R2_STREAM_SIZE] = {
+		1, 151, 0, 0, 15, 2, 3, 3, 3, 0, 170,
+	};
+	memcpy(stream, default_stream, sizeof(default_stream));
+}
+
+static int initialize_helper(struct impl *this, const uint8_t *codec_config,
+		size_t codec_config_size)
+{
+	struct aptx_adaptive_helper_config config = { 0 };
+	uint8_t ready[8];
+	int result;
+
+	config.protocol_version = APTX_ADAPTIVE_HELPER_PROTOCOL_VERSION;
+	config.source_rate = this->source_rate;
+	config.encoder_rate = this->codec_rate;
+	config.mode = this->mode;
+	config.profile = this->profile;
+	config.mtu = this->mtu > 0 ? (uint32_t)this->mtu : 995u;
+	config.abr_enabled = 1;
+	config.cie_size = APTX_ADAPTIVE_HELPER_CIE_SIZE;
+	memcpy(config.cie, codec_config,
+			SPA_MIN(codec_config_size, sizeof(config.cie)));
+	init_r2_stream(config.r2_stream);
+
+	if ((result = read_full(this->output_fd, ready, sizeof(ready))) < 0)
+		return result;
+	if (read_u32le(ready) != 0 || read_u32le(ready + 4) != 0)
+		return -EPROTO;
+
+	if ((result = helper_control(this, APTX_ADAPTIVE_HELPER_COMMAND_CONFIG,
+				&config, sizeof(config))) < 0)
+		return result;
+
+	/* Start at the highest Adaptive quality level. */
+	if ((result = helper_control(this,
+			APTX_ADAPTIVE_HELPER_COMMAND_SET_BITRATE,
+			&adaptive_bitrates[APTX_ADAPTIVE_ABR_LEVELS - 1],
+			sizeof(adaptive_bitrates[0]))) < 0)
+		return result;
+	return 0;
+}
+
+static int32_t downsample2_sample(const struct impl *this,
+		const int32_t *src, uint32_t source_frames, int channel, int index)
+{
+	if (index < 0)
+		return this->downsample_history[channel]
+			[APTX_ADAPTIVE_DOWNSAMPLE_HISTORY + index];
+	if ((uint32_t)index >= source_frames)
+		return 0;
+	return src[(size_t)index * APTX_ADAPTIVE_CHANNELS + (size_t)channel];
+}
+
+static int32_t scale_filter_sum(int64_t sum)
+{
+	if (sum >= 0)
+		sum += 1 << 14;
+	else
+		sum -= 1 << 14;
+	sum >>= 15;
+	if (sum > INT32_MAX)
+		return INT32_MAX;
+	if (sum < INT32_MIN)
+		return INT32_MIN;
+	return (int32_t)sum;
+}
+
+static void downsample2(struct impl *this, const void *source)
+{
+	const int32_t *src = source;
+	const uint32_t source_frames = this->source_frames;
+
+	for (uint32_t output_frame = 0;
+			output_frame < APTX_ADAPTIVE_CODEC_FRAMES; ++output_frame) {
+		int source_index = (int)(output_frame * 2u);
+		for (unsigned int channel = 0; channel < APTX_ADAPTIVE_CHANNELS; ++channel) {
+			int64_t sum = 0;
+			for (unsigned int tap = 0; tap < APTX_ADAPTIVE_DOWNSAMPLE_TAPS; ++tap)
+				sum += (int64_t)downsample2_coeffs[tap] *
+					downsample2_sample(this, src, source_frames, (int)channel,
+						source_index - (int)tap);
+			this->codec_pcm[(size_t)output_frame * APTX_ADAPTIVE_CHANNELS + channel] =
+				scale_filter_sum(sum);
+		}
+	}
+
+	for (unsigned int channel = 0; channel < APTX_ADAPTIVE_CHANNELS; ++channel)
+		for (unsigned int i = 0; i < APTX_ADAPTIVE_DOWNSAMPLE_HISTORY; ++i)
+			this->downsample_history[channel][i] = src[
+				(size_t)(source_frames - APTX_ADAPTIVE_DOWNSAMPLE_HISTORY + i) *
+						APTX_ADAPTIVE_CHANNELS + channel];
+}
+
 static int codec_fill_caps(const struct media_codec *codec, uint32_t flags,
 		const struct spa_dict *settings, uint8_t caps[A2DP_MAX_CAPS_SIZE])
 {
-	static const a2dp_aptx_adaptive_t adaptive_caps = {
-		.info = {
-			.vendor_id = APTX_ADAPTIVE_VENDOR_ID,
-			.codec_id = APTX_ADAPTIVE_CODEC_ID,
-		},
-		.sampling_freq = APTX_ADAPTIVE_SAMPLING_FREQ_48000,
-		.channel_mode = APTX_ADAPTIVE_CHANNEL_MODE_JOINT_STEREO,
-	};
+	a2dp_aptx_adaptive_t adaptive_caps = { 0 };
 
-	(void)codec;
 	(void)flags;
 	(void)settings;
 	if (!helper_available())
 		return -ENOTSUP;
 
+	adaptive_caps.info = codec->vendor;
+	adaptive_caps.sampling_freq =
+			APTX_ADAPTIVE_SAMPLING_FREQ_44100 |
+			APTX_ADAPTIVE_SAMPLING_FREQ_48000 |
+			APTX_ADAPTIVE_SAMPLING_FREQ_96000;
+	adaptive_caps.channel_mode = APTX_ADAPTIVE_CHANNEL_MODE_CAPABILITIES;
 	memcpy(caps, &adaptive_caps, sizeof(adaptive_caps));
 	return sizeof(adaptive_caps);
 }
@@ -214,27 +423,33 @@ static int codec_select_config(const struct media_codec *codec, uint32_t flags,
 		void **config_data)
 {
 	a2dp_aptx_adaptive_t conf;
+	const struct adaptive_rate *rate;
+	uint32_t requested_rate = info == NULL || info->rate == 0 ?
+			48000 : info->rate;
 
 	(void)flags;
 	(void)settings;
 	(void)config_data;
 	if (caps == NULL || caps_size < sizeof(conf))
 		return -EINVAL;
-
 	memcpy(&conf, caps, sizeof(conf));
+
 	if (codec->vendor.vendor_id != conf.info.vendor_id ||
 			codec->vendor.codec_id != conf.info.codec_id)
 		return -ENOTSUP;
-	if (!helper_available() ||
-			(info != NULL && (info->rate != APTX_ADAPTIVE_RATE ||
-					info->channels != APTX_ADAPTIVE_CHANNELS)))
+	if (!helper_available() || (rate = find_rate(requested_rate)) == NULL)
 		return -ENOTSUP;
-	if (!(conf.sampling_freq & APTX_ADAPTIVE_SAMPLING_FREQ_48000) ||
-			!(conf.channel_mode & APTX_ADAPTIVE_CHANNEL_MODE_JOINT_STEREO))
+	if ((conf.sampling_freq & rate->codec_frequency) != rate->codec_frequency)
 		return -ENOTSUP;
 
-	conf.sampling_freq = APTX_ADAPTIVE_SAMPLING_FREQ_48000;
-	conf.channel_mode = APTX_ADAPTIVE_CHANNEL_MODE_JOINT_STEREO;
+	conf.sampling_freq = rate->codec_frequency;
+	if (conf.channel_mode & APTX_ADAPTIVE_CHANNEL_MODE_JOINT_STEREO)
+		conf.channel_mode = APTX_ADAPTIVE_CHANNEL_MODE_JOINT_STEREO;
+	else if (conf.channel_mode & APTX_ADAPTIVE_CHANNEL_MODE_STEREO)
+		conf.channel_mode = APTX_ADAPTIVE_CHANNEL_MODE_STEREO;
+	else
+		return -ENOTSUP;
+
 	memcpy(config, &conf, sizeof(conf));
 	return sizeof(conf);
 }
@@ -243,22 +458,57 @@ static int codec_enum_config(const struct media_codec *codec, uint32_t flags,
 		const void *caps, size_t caps_size, uint32_t id, uint32_t idx,
 		struct spa_pod_builder *b, struct spa_pod **param)
 {
-	struct spa_audio_info_raw info = { 0 };
+	a2dp_aptx_adaptive_t conf;
+	struct spa_pod_frame f[2];
+	struct spa_pod_choice *choice;
+	uint32_t position[2] = { SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR };
+	uint32_t count = 0;
 
 	(void)codec;
 	(void)flags;
-	(void)caps;
-	(void)caps_size;
+	if (caps == NULL || caps_size < sizeof(conf))
+		return -EINVAL;
 	if (idx > 0)
 		return 0;
+	memcpy(&conf, caps, sizeof(conf));
 
-	info.format = SPA_AUDIO_FORMAT_S32;
-	info.channels = APTX_ADAPTIVE_CHANNELS;
-	info.position[0] = SPA_AUDIO_CHANNEL_FL;
-	info.position[1] = SPA_AUDIO_CHANNEL_FR;
-	info.rate = APTX_ADAPTIVE_RATE;
-	*param = spa_format_audio_raw_build(b, id, &info);
+	spa_pod_builder_push_object(b, &f[0], SPA_TYPE_OBJECT_Format, id);
+	spa_pod_builder_add(b,
+			SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_audio),
+			SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+			SPA_FORMAT_AUDIO_format, SPA_POD_Id(SPA_AUDIO_FORMAT_S32),
+			SPA_FORMAT_AUDIO_channels, SPA_POD_Int(APTX_ADAPTIVE_CHANNELS),
+			SPA_FORMAT_AUDIO_position, SPA_POD_Array(sizeof(uint32_t),
+					SPA_TYPE_Id, SPA_N_ELEMENTS(position), position),
+			0);
+	spa_pod_builder_prop(b, SPA_FORMAT_AUDIO_rate, 0);
+	spa_pod_builder_push_choice(b, &f[1], SPA_CHOICE_None, 0);
+	choice = (struct spa_pod_choice *)spa_pod_builder_frame(b, &f[1]);
+
+	for (size_t i = 0; i < SPA_N_ELEMENTS(adaptive_rates); ++i) {
+		const struct adaptive_rate *rate = &adaptive_rates[i];
+		if ((conf.sampling_freq & rate->codec_frequency) != rate->codec_frequency)
+			continue;
+		spa_pod_builder_int(b, (int)rate->graph_rate);
+		count++;
+	}
+	if (count == 0)
+		return -ENOTSUP;
+	if (count > 1)
+		choice->body.type = SPA_CHOICE_Enum;
+	spa_pod_builder_pop(b, &f[1]);
+	*param = spa_pod_builder_pop(b, &f[0]);
 	return *param == NULL ? -EIO : 1;
+}
+
+static void codec_deinit(void *data)
+{
+	struct impl *this = data;
+	if (this == NULL)
+		return;
+	close_fds(this->input_fd, this->output_fd);
+	reap_helper(this->pid);
+	free(this);
 }
 
 static void *codec_init(const struct media_codec *codec, uint32_t flags,
@@ -266,19 +516,25 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 		void *props, size_t mtu)
 {
 	struct impl *this;
+	const struct adaptive_rate *rate;
+	uint32_t source_rate;
 
 	(void)codec;
 	(void)flags;
-	(void)config;
 	(void)props;
-	(void)mtu;
 	if (config == NULL || config_len < sizeof(a2dp_aptx_adaptive_t) ||
 			info == NULL || info->media_type != SPA_MEDIA_TYPE_audio ||
 			info->media_subtype != SPA_MEDIA_SUBTYPE_raw ||
 			info->info.raw.format != SPA_AUDIO_FORMAT_S32 ||
-			info->info.raw.rate != APTX_ADAPTIVE_RATE ||
 			info->info.raw.channels != APTX_ADAPTIVE_CHANNELS ||
 			!helper_available()) {
+		errno = ENOTSUP;
+		return NULL;
+	}
+
+	source_rate = info->info.raw.rate;
+	rate = find_rate(source_rate);
+	if (rate == NULL) {
 		errno = ENOTSUP;
 		return NULL;
 	}
@@ -286,15 +542,29 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 	this = calloc(1, sizeof(*this));
 	if (this == NULL)
 		return NULL;
+	this->pid = -1;
 	this->input_fd = -1;
 	this->output_fd = -1;
-	this->block_size = APTX_ADAPTIVE_BLOCK_SIZE;
+	this->source_rate = source_rate;
+	this->codec_rate = rate->codec_rate;
+	this->source_frames = APTX_ADAPTIVE_CODEC_FRAMES *
+			(source_rate == rate->codec_rate ? 1u : 2u);
+	this->block_size = (int)(this->source_frames * APTX_ADAPTIVE_CHANNELS *
+			(APTX_ADAPTIVE_BITS_PER_SAMPLE / 8u));
+	this->mtu = mtu > 0 ? (int)mtu : 995;
+	this->mode = get_helper_mode(source_rate);
+	this->profile = get_profile();
+	this->downsample2 = source_rate != rate->codec_rate;
+	this->abr_enabled = true;
+	this->abr_level = APTX_ADAPTIVE_ABR_LEVELS - 1;
+	this->abr_pending_level = this->abr_level;
+
+	if (this->mode == APTX_ADAPTIVE_HELPER_MODE_R3 && source_rate != 48000)
+		goto error;
 	this->pid = spawn_helper(&this->input_fd, &this->output_fd);
 	if (this->pid < 0)
 		goto error;
-	uint8_t ready[8];
-	if (read_full(this->output_fd, ready, sizeof(ready)) < 0 ||
-			read_u32le(ready) != 0 || read_u32le(ready + 4) != 0)
+	if (initialize_helper(this, config, config_len) < 0)
 		goto error;
 	return this;
 
@@ -302,19 +572,8 @@ error:
 	close_fds(this->input_fd, this->output_fd);
 	reap_helper(this->pid);
 	free(this);
-	errno = EIO;
+	errno = ENOTSUP;
 	return NULL;
-}
-
-static void codec_deinit(void *data)
-{
-	struct impl *this = data;
-
-	if (this == NULL)
-		return;
-	close_fds(this->input_fd, this->output_fd);
-	reap_helper(this->pid);
-	free(this);
 }
 
 static int codec_get_block_size(void *data)
@@ -340,11 +599,11 @@ static int codec_encode(void *data, const void *src, size_t src_size,
 	struct impl *this = data;
 	uint8_t request_size[4];
 	uint8_t response[8];
-	uint8_t packet[APTX_ADAPTIVE_MAX_PACKET_SIZE];
 	struct aptx_adaptive_ota_header header;
 	const uint8_t *payload;
 	size_t consumed;
-	int res;
+	const void *helper_src = src;
+	int result;
 
 	if (src == NULL || src_size < (size_t)this->block_size ||
 			dst == NULL || dst_out == NULL || need_flush == NULL)
@@ -352,46 +611,89 @@ static int codec_encode(void *data, const void *src, size_t src_size,
 	if (dst_size == 0)
 		return -ENOSPC;
 
-	request_size[0] = this->block_size & 0xff;
-	request_size[1] = (this->block_size >> 8) & 0xff;
-	request_size[2] = (this->block_size >> 16) & 0xff;
-	request_size[3] = (this->block_size >> 24) & 0xff;
-	if ((res = write_full(this->input_fd, request_size, sizeof(request_size))) < 0 ||
-			(res = write_full(this->input_fd, src, this->block_size)) < 0 ||
-			(res = read_full(this->output_fd, &response, sizeof(response))) < 0)
-		return res;
+	if (this->downsample2) {
+		downsample2(this, src);
+		helper_src = this->codec_pcm;
+	}
+	write_u32le(request_size, APTX_ADAPTIVE_CODEC_BYTES);
+	if ((result = write_full(this->input_fd, request_size, sizeof(request_size))) < 0 ||
+			(result = write_full(this->input_fd, helper_src,
+				APTX_ADAPTIVE_CODEC_BYTES)) < 0 ||
+			(result = read_full(this->output_fd, response, sizeof(response))) < 0)
+		return result;
 
 	uint32_t response_status = read_u32le(response);
 	uint32_t response_size = read_u32le(response + 4);
 	if (response_status != 0 || response_size == 0 ||
-			response_size > sizeof(packet))
-		return -EIO;
-	if (response_size > dst_size)
-		return -ENOSPC;
-	if ((res = read_full(this->output_fd, packet, response_size)) < 0)
-		return res;
-	if (aptx_adaptive_next_ota_packet(packet, response_size, &header,
+			response_size > sizeof(this->packet))
+		return response_status == 0 ? -EAGAIN : -EIO;
+	if ((result = read_full(this->output_fd, this->packet, response_size)) < 0)
+		return result;
+	if (aptx_adaptive_next_ota_packet(this->packet, response_size, &header,
 			&payload, &consumed) < 0 || consumed != response_size)
 		return -EBADMSG;
+	if (response_size > dst_size)
+		return -ENOSPC;
 
-	memcpy(dst, packet, response_size);
+	memcpy(dst, this->packet, response_size);
 	*dst_out = response_size;
 	*need_flush = NEED_FLUSH_ALL;
 	return this->block_size;
 }
 
+static unsigned int abr_level_for_unsent(const struct impl *this, size_t unsent)
+{
+	size_t mtu = this->mtu > 0 ? (size_t)this->mtu : 995u;
+	/* media-sink reports free socket space, so less free space means a lower
+	 * link-quality level. */
+	if (unsent <= mtu / 2)
+		return 0;
+	if (unsent <= mtu)
+		return 1;
+	if (unsent <= mtu * 2)
+		return 2;
+	if (unsent <= mtu * 3)
+		return 3;
+	return 4;
+}
+
 static int codec_abr_process(void *data, size_t unsent)
 {
-	(void)data;
-	(void)unsent;
-	return -ENOTSUP;
+	struct impl *this = data;
+	unsigned int target;
+	int result;
+
+	if (!this->abr_enabled)
+		return 0;
+
+	target = abr_level_for_unsent(this, unsent);
+	if (target == this->abr_level) {
+		this->abr_pending_level = target;
+		this->abr_pending_count = 0;
+		return 0;
+	}
+	if (target != this->abr_pending_level) {
+		this->abr_pending_level = target;
+		this->abr_pending_count = 1;
+		return 0;
+	}
+	if (++this->abr_pending_count < APTX_ADAPTIVE_ABR_CONFIRMATIONS)
+		return 0;
+
+	result = helper_control(this, APTX_ADAPTIVE_HELPER_COMMAND_SET_BITRATE,
+			&adaptive_bitrates[target], sizeof(adaptive_bitrates[0]));
+	if (result == 0) {
+		this->abr_level = target;
+		this->abr_pending_count = 0;
+	}
+	return result;
 }
 
 static void codec_get_delay(void *data, uint32_t *encoder, uint32_t *decoder)
 {
-	(void)data;
+	struct impl *this = data;
 	if (encoder)
-		*encoder = 0;
+		*encoder = this->downsample2 ? 7 : 0;
 	if (decoder)
 		*decoder = 0;
 }

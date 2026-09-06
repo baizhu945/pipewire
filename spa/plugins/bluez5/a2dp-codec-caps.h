@@ -168,22 +168,22 @@
 #define APTX_HD_SAMPLING_FREQ_48000     0x1
 
 /* aptX Adaptive vendor-specific codec information.  The 40-byte codec
- * information element is the layout used by Qualcomm's A2DP implementation:
- * vendor/codec IDs, frequency and channel masks, six TTP bytes, three EOC
- * bytes, and 23 reserved bytes. */
+ * information element is the layout used by the Qualcomm A2DP stack.  The
+ * first codec-specific byte uses the Qualcomm frequency mask; the following
+ * byte carries the channel-mode capability. */
 #define APTX_ADAPTIVE_VENDOR_ID          0x000000d7
 #define APTX_ADAPTIVE_CODEC_ID           0x00ad
 
-#define APTX_ADAPTIVE_SAMPLING_FREQ_44100  0x08
+#define APTX_ADAPTIVE_SAMPLING_FREQ_44100  0x40
 #define APTX_ADAPTIVE_SAMPLING_FREQ_48000  0x10
-#define APTX_ADAPTIVE_SAMPLING_FREQ_88000  0x20
-#define APTX_ADAPTIVE_SAMPLING_FREQ_192000 0x40
+#define APTX_ADAPTIVE_SAMPLING_FREQ_96000  0xa0
 
 #define APTX_ADAPTIVE_CHANNEL_MODE_MONO         0x01
 #define APTX_ADAPTIVE_CHANNEL_MODE_STEREO       0x02
 #define APTX_ADAPTIVE_CHANNEL_MODE_TWS_STEREO   0x04
 #define APTX_ADAPTIVE_CHANNEL_MODE_JOINT_STEREO 0x08
 #define APTX_ADAPTIVE_CHANNEL_MODE_TWS_MONO     0x10
+#define APTX_ADAPTIVE_CHANNEL_MODE_CAPABILITIES 0x3e
 
 #define APTX_LL_VENDOR_ID		0x0000000a
 #define APTX_LL_VENDOR_ID2		0x000000d7
