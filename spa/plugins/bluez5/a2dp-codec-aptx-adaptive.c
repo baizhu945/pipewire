@@ -64,6 +64,8 @@ static const int32_t downsample2_coeffs[APTX_ADAPTIVE_DOWNSAMPLE_TAPS] = {
 	0, 9590, 0, -1595, 0, 188, 0,
 };
 
+static struct spa_log *log_;
+
 struct adaptive_rate {
 	uint32_t graph_rate;
 	uint32_t codec_rate;
@@ -148,6 +150,20 @@ static void adaptive_init_caps(a2dp_aptx_adaptive_t *caps,
 			sizeof(caps->setup_pref));
 	caps->eoc[0] = APTX_ADAPTIVE_EOC0;
 	caps->eoc[1] = APTX_ADAPTIVE_EOC1;
+}
+
+static void adaptive_log_caps(const char *label,
+		const a2dp_aptx_adaptive_t *caps)
+{
+	if (log_ == NULL)
+		return;
+	spa_log_debug(log_,
+			"aptX Adaptive %s: freq-source=0x%02x channel=0x%02x "
+			"ext=%u features=0x%08x setup=%02x%02x%02x%02x eoc=%02x%02x",
+			label, caps->sampling_freq_source_type, caps->channel_mode,
+			caps->cap_ext_ver_num, adaptive_read_features(caps),
+			caps->setup_pref[0], caps->setup_pref[1], caps->setup_pref[2],
+			caps->setup_pref[3], caps->eoc[0], caps->eoc[1]);
 }
 
 SPA_STATIC_ASSERT(sizeof(a2dp_aptx_adaptive_t) == 40);
@@ -561,6 +577,7 @@ static int codec_fill_caps(const struct media_codec *codec, uint32_t flags,
 			APTX_ADAPTIVE_SAMPLING_FREQ_96000,
 			APTX_ADAPTIVE_SOURCE_TYPE_2);
 	adaptive_caps.info = codec->vendor;
+	adaptive_log_caps("local capabilities", &adaptive_caps);
 	memcpy(caps, &adaptive_caps, sizeof(adaptive_caps));
 	return sizeof(adaptive_caps);
 }
@@ -591,6 +608,7 @@ static int codec_select_config(const struct media_codec *codec, uint32_t flags,
 	if (caps == NULL || caps_size < sizeof(peer))
 		return -EINVAL;
 	memcpy(&peer, caps, sizeof(peer));
+	adaptive_log_caps("peer capabilities", &peer);
 
 	if (codec->vendor.vendor_id != peer.info.vendor_id ||
 			codec->vendor.codec_id != peer.info.codec_id)
@@ -660,6 +678,13 @@ static int codec_select_config(const struct media_codec *codec, uint32_t flags,
 	}
 
 	memcpy(config, &result, sizeof(result));
+	if (log_ != NULL)
+		spa_log_info(log_,
+				"aptX Adaptive selected: requested-rate=%u codec-rate=%u "
+				"peer-r22=%d negotiated-channel=0x%02x",
+				requested_rate, rate->codec_rate, peer_supports_r22,
+				result.channel_mode);
+	adaptive_log_caps("negotiated configuration", &result);
 	return sizeof(result);
 }
 
@@ -801,6 +826,13 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 			this->source_bytes);
 	this->abr_level = APTX_ADAPTIVE_ABR_LEVELS - 1;
 	this->abr_pending_level = this->abr_level;
+	if (log_ != NULL)
+		spa_log_info(log_,
+				"aptX Adaptive encoder init: source-rate=%u codec-rate=%u "
+				"format=%d block=%d mtu=%d mode=%d lossless=%d qhs=%d",
+				this->source_rate, this->codec_rate, this->pcm_format,
+				this->block_size, this->mtu, this->mode,
+				this->lossless_mode, this->qhs_supported);
 
 	if (this->mode == APTX_ADAPTIVE_HELPER_MODE_R3 &&
 			(source_rate != 48000 || this->pcm_format != ADAPTIVE_PCM_S32))
@@ -1010,6 +1042,12 @@ static void codec_get_delay(void *data, uint32_t *encoder, uint32_t *decoder)
 		*decoder = 0;
 }
 
+static void codec_set_log(struct spa_log *global_log)
+{
+	log_ = global_log;
+	spa_log_topic_init(log_, &codec_plugin_log_topic);
+}
+
 const struct media_codec a2dp_codec_aptx_adaptive = {
 	.id = SPA_BLUETOOTH_AUDIO_CODEC_APTX_ADAPTIVE,
 	.kind = MEDIA_CODEC_A2DP,
@@ -1028,6 +1066,7 @@ const struct media_codec a2dp_codec_aptx_adaptive = {
 	.start_encode = codec_start_encode,
 	.encode = codec_encode,
 	.get_delay = codec_get_delay,
+	.set_log = codec_set_log,
 };
 
 MEDIA_CODEC_EXPORT_DEF("aptx-adaptive", &a2dp_codec_aptx_adaptive);
