@@ -167,23 +167,47 @@
 #define APTX_HD_SAMPLING_FREQ_44100     0x2
 #define APTX_HD_SAMPLING_FREQ_48000     0x1
 
-/* aptX Adaptive vendor-specific codec information.  The 40-byte codec
- * information element is the layout used by the Qualcomm A2DP stack.  The
- * first codec-specific byte uses the Qualcomm frequency mask; the following
- * byte carries the channel-mode capability. */
+/* aptX Adaptive vendor-specific codec information.  The 40-byte body below
+ * is the serialized body of the Qualcomm 42-byte A2DP codec information
+ * element (the extra two bytes are the media type and codec type). */
 #define APTX_ADAPTIVE_VENDOR_ID          0x000000d7
 #define APTX_ADAPTIVE_CODEC_ID           0x00ad
 
 #define APTX_ADAPTIVE_SAMPLING_FREQ_44100  0x40
 #define APTX_ADAPTIVE_SAMPLING_FREQ_48000  0x10
 #define APTX_ADAPTIVE_SAMPLING_FREQ_96000  0xa0
+#define APTX_ADAPTIVE_SAMPLING_FREQ_MASK   0xf8
+
+#define APTX_ADAPTIVE_SOURCE_TYPE_1        0x00
+#define APTX_ADAPTIVE_SOURCE_TYPE_2        0x02
+#define APTX_ADAPTIVE_SOURCE_TYPE_MASK     0x07
 
 #define APTX_ADAPTIVE_CHANNEL_MODE_MONO         0x01
 #define APTX_ADAPTIVE_CHANNEL_MODE_STEREO       0x02
 #define APTX_ADAPTIVE_CHANNEL_MODE_TWS_STEREO   0x04
 #define APTX_ADAPTIVE_CHANNEL_MODE_JOINT_STEREO 0x08
 #define APTX_ADAPTIVE_CHANNEL_MODE_TWS_MONO     0x10
+#define APTX_ADAPTIVE_CHANNEL_MODE_TWS_PLUS     0x20
 #define APTX_ADAPTIVE_CHANNEL_MODE_CAPABILITIES 0x3e
+#define APTX_ADAPTIVE_CHANNEL_MODE_STEREO_SOURCE \
+	(APTX_ADAPTIVE_CHANNEL_MODE_STEREO | \
+	 APTX_ADAPTIVE_CHANNEL_MODE_JOINT_STEREO)
+
+#define APTX_ADAPTIVE_CAP_EXT_VER_NUM          0x01
+#define APTX_ADAPTIVE_SUPPORTED_FEATURES       0x0f000000u
+#define APTX_ADAPTIVE_R2_1_SUPPORTED_FEATURES  0x0f000003u
+#define APTX_ADAPTIVE_R2_2_SUPPORTED_FEATURES  0x0f000017u
+#define APTX_ADAPTIVE_R2_2_SUPPORT_CAP         0x00000080u
+
+#define APTX_ADAPTIVE_TTP_LL_0                0x50
+#define APTX_ADAPTIVE_TTP_LL_1                0x64
+#define APTX_ADAPTIVE_TTP_HQ_0                0x64
+#define APTX_ADAPTIVE_TTP_HQ_1                0x64
+#define APTX_ADAPTIVE_TTP_TWS_0               0xff
+#define APTX_ADAPTIVE_TTP_TWS_1               0xff
+#define APTX_ADAPTIVE_RESERVED_15THBYTE       0x00
+#define APTX_ADAPTIVE_EOC0                    0x00
+#define APTX_ADAPTIVE_EOC1                    0xaa
 
 #define APTX_LL_VENDOR_ID		0x0000000a
 #define APTX_LL_VENDOR_ID2		0x000000d7
@@ -420,11 +444,16 @@ typedef struct {
 
 typedef struct {
 	a2dp_vendor_codec_t info;
-	uint8_t sampling_freq;
+	/* The low three bits are sourceType; the upper five are sampleRate. */
+	uint8_t sampling_freq_source_type;
 	uint8_t channel_mode;
 	uint8_t ttp[6];
-	uint8_t eoc[3];
-	uint8_t reserved[23];
+	uint8_t reserved_15thbyte;
+	uint8_t cap_ext_ver_num;
+	uint8_t supported_features[4];
+	uint8_t setup_pref[4];
+	uint8_t eoc[2];
+	uint8_t reserved[14];
 } __attribute__ ((packed)) a2dp_aptx_adaptive_t;
 
 typedef struct {

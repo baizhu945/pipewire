@@ -3,6 +3,7 @@
 
 #include "config.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdbool.h>
@@ -21,6 +22,7 @@
 
 #include "a2dp-codec-caps.h"
 #include "media-codecs.h"
+#include "rtp.h"
 
 /*
  * This bridge is opt-in at runtime.  PipeWire talks to a long-lived helper
@@ -46,6 +48,7 @@
 	 APTX_ADAPTIVE_CODEC_FRAMES)
 #define APTX_ADAPTIVE_MAX_PACKET_SIZE 4096u
 #define APTX_ADAPTIVE_MAX_SOURCE_FRAMES (APTX_ADAPTIVE_CODEC_FRAMES * 2u)
+#define APTX_ADAPTIVE_RTP_HEADER_SIZE ((size_t)sizeof(struct rtp_header))
 
 #define APTX_ADAPTIVE_ABR_LEVELS 5u
 #define APTX_ADAPTIVE_ABR_CONFIRMATIONS 3u
@@ -74,6 +77,78 @@ static const struct adaptive_rate adaptive_rates[] = {
 	{ 192000, 96000, APTX_ADAPTIVE_SAMPLING_FREQ_96000 },
 };
 
+enum adaptive_pcm_format {
+	ADAPTIVE_PCM_S16,
+	ADAPTIVE_PCM_S24_32,
+	ADAPTIVE_PCM_S32,
+};
+
+static const uint8_t adaptive_ttp[6] = {
+	APTX_ADAPTIVE_TTP_LL_0,
+	APTX_ADAPTIVE_TTP_LL_1,
+	APTX_ADAPTIVE_TTP_HQ_0,
+	APTX_ADAPTIVE_TTP_HQ_1,
+	APTX_ADAPTIVE_TTP_TWS_0,
+	APTX_ADAPTIVE_TTP_TWS_1,
+};
+
+static const uint8_t adaptive_setup_pref[4] = { 2, 3, 3, 3 };
+
+static uint32_t adaptive_read_features(const a2dp_aptx_adaptive_t *caps)
+{
+	return (uint32_t)caps->supported_features[0] |
+			(uint32_t)caps->supported_features[1] << 8 |
+			(uint32_t)caps->supported_features[2] << 16 |
+			(uint32_t)caps->supported_features[3] << 24;
+}
+
+static void adaptive_write_features(a2dp_aptx_adaptive_t *caps,
+		uint32_t features)
+{
+	caps->supported_features[0] = features & 0xff;
+	caps->supported_features[1] = (features >> 8) & 0xff;
+	caps->supported_features[2] = (features >> 16) & 0xff;
+	caps->supported_features[3] = (features >> 24) & 0xff;
+}
+
+static uint8_t adaptive_sampling_freq(const a2dp_aptx_adaptive_t *caps)
+{
+	return caps->sampling_freq_source_type & APTX_ADAPTIVE_SAMPLING_FREQ_MASK;
+}
+
+static uint8_t adaptive_source_type(const a2dp_aptx_adaptive_t *caps)
+{
+	return caps->sampling_freq_source_type & APTX_ADAPTIVE_SOURCE_TYPE_MASK;
+}
+
+static void adaptive_set_sampling_freq(a2dp_aptx_adaptive_t *caps,
+		uint8_t sampling_freq)
+{
+	caps->sampling_freq_source_type =
+			(sampling_freq & APTX_ADAPTIVE_SAMPLING_FREQ_MASK) |
+			(adaptive_source_type(caps) & APTX_ADAPTIVE_SOURCE_TYPE_MASK);
+}
+
+static void adaptive_init_caps(a2dp_aptx_adaptive_t *caps,
+		uint32_t features, uint8_t sampling_freq, uint8_t source_type)
+{
+	memset(caps, 0, sizeof(*caps));
+	caps->info.vendor_id = APTX_ADAPTIVE_VENDOR_ID;
+	caps->info.codec_id = APTX_ADAPTIVE_CODEC_ID;
+	caps->sampling_freq_source_type =
+			(sampling_freq & APTX_ADAPTIVE_SAMPLING_FREQ_MASK) |
+			(source_type & APTX_ADAPTIVE_SOURCE_TYPE_MASK);
+	caps->channel_mode = APTX_ADAPTIVE_CHANNEL_MODE_STEREO_SOURCE;
+	memcpy(caps->ttp, adaptive_ttp, sizeof(caps->ttp));
+	caps->reserved_15thbyte = APTX_ADAPTIVE_RESERVED_15THBYTE;
+	caps->cap_ext_ver_num = APTX_ADAPTIVE_CAP_EXT_VER_NUM;
+	adaptive_write_features(caps, features);
+	memcpy(caps->setup_pref, adaptive_setup_pref,
+			sizeof(caps->setup_pref));
+	caps->eoc[0] = APTX_ADAPTIVE_EOC0;
+	caps->eoc[1] = APTX_ADAPTIVE_EOC1;
+}
+
 SPA_STATIC_ASSERT(sizeof(a2dp_aptx_adaptive_t) == 40);
 
 struct impl {
@@ -89,10 +164,11 @@ struct impl {
 	enum aptx_adaptive_helper_mode mode;
 	uint32_t profile;
 	bool downsample2;
-	bool input_s16;
+	enum adaptive_pcm_format pcm_format;
 	uint32_t source_bytes;
 	enum aptx_adaptive_helper_lossless_mode lossless_mode;
 	bool qhs_supported;
+	uint8_t r2_stream[APTX_ADAPTIVE_HELPER_R2_STREAM_SIZE];
 
 	int32_t downsample_history[APTX_ADAPTIVE_CHANNELS]
 		[APTX_ADAPTIVE_DOWNSAMPLE_HISTORY];
@@ -142,7 +218,9 @@ static enum aptx_adaptive_helper_lossless_mode get_lossless_mode(void)
 {
 	const char *value = getenv(APTX_ADAPTIVE_LOSSLESS_ENV);
 
-	if (value == NULL || spa_streq(value, "auto") || spa_streq(value, "AUTO"))
+	if (value == NULL || spa_streq(value, "off") || spa_streq(value, "OFF"))
+		return APTX_ADAPTIVE_HELPER_LOSSLESS_OFF;
+	if (spa_streq(value, "auto") || spa_streq(value, "AUTO"))
 		return APTX_ADAPTIVE_HELPER_LOSSLESS_AUTO;
 	if (spa_streq(value, "force") || spa_streq(value, "FORCE"))
 		return APTX_ADAPTIVE_HELPER_LOSSLESS_FORCE;
@@ -349,25 +427,30 @@ static int hex_value(char value)
 
 static int init_r2_stream(uint8_t stream[APTX_ADAPTIVE_HELPER_R2_STREAM_SIZE])
 {
-	static const uint8_t default_stream[APTX_ADAPTIVE_HELPER_R2_STREAM_SIZE] = {
-		1, 151, 0, 0, 15, 2, 3, 3, 3, 0, 170,
-	};
 	const char *value = getenv(APTX_ADAPTIVE_STREAM_ENV);
 
-	if (value != NULL) {
-		if (strlen(value) != APTX_ADAPTIVE_HELPER_R2_STREAM_SIZE * 2u)
-			return -EINVAL;
-		for (size_t i = 0; i < APTX_ADAPTIVE_HELPER_R2_STREAM_SIZE; ++i) {
-			int high = hex_value(value[i * 2]);
-			int low = hex_value(value[i * 2 + 1]);
-			if (high < 0 || low < 0)
-				return -EINVAL;
-			stream[i] = (uint8_t)((high << 4) | low);
-		}
+	if (value == NULL)
 		return 0;
+	if (strlen(value) != APTX_ADAPTIVE_HELPER_R2_STREAM_SIZE * 2u)
+		return -EINVAL;
+	for (size_t i = 0; i < APTX_ADAPTIVE_HELPER_R2_STREAM_SIZE; ++i) {
+		int high = hex_value(value[i * 2]);
+		int low = hex_value(value[i * 2 + 1]);
+		if (high < 0 || low < 0)
+			return -EINVAL;
+		stream[i] = (uint8_t)((high << 4) | low);
 	}
-	memcpy(stream, default_stream, sizeof(default_stream));
 	return 0;
+}
+
+static void build_r2_stream(const a2dp_aptx_adaptive_t *caps,
+		uint8_t stream[APTX_ADAPTIVE_HELPER_R2_STREAM_SIZE])
+{
+	stream[0] = caps->cap_ext_ver_num;
+	memcpy(stream + 1, caps->supported_features,
+			sizeof(caps->supported_features));
+	memcpy(stream + 5, caps->setup_pref, sizeof(caps->setup_pref));
+	memcpy(stream + 9, caps->eoc, sizeof(caps->eoc));
 }
 
 static int initialize_helper(struct impl *this, const uint8_t *codec_config,
@@ -382,14 +465,18 @@ static int initialize_helper(struct impl *this, const uint8_t *codec_config,
 	config.encoder_rate = this->codec_rate;
 	config.mode = this->mode;
 	config.profile = this->profile;
-	config.mtu = this->mtu > 0 ? (uint32_t)this->mtu : 995u;
+	config.mtu = this->mtu > (int)APTX_ADAPTIVE_RTP_HEADER_SIZE ?
+			(uint32_t)this->mtu - APTX_ADAPTIVE_RTP_HEADER_SIZE : 0u;
 	config.abr_enabled = this->abr_enabled ? 1u : 0u;
-	config.bits_per_sample = this->input_s16 ? 16u : 32u;
+	/* The helper boundary is always S32/Q27.  Source bit depth is not an
+	 * OTA capability and is deliberately not used while Lossless is disabled. */
+	config.bits_per_sample = 32u;
 	config.lossless_mode = this->lossless_mode;
 	config.qhs_supported = this->qhs_supported ? 1u : 0u;
 	config.cie_size = APTX_ADAPTIVE_HELPER_CIE_SIZE;
 	memcpy(config.cie, codec_config,
 			SPA_MIN(codec_config_size, sizeof(config.cie)));
+	memcpy(config.r2_stream, this->r2_stream, sizeof(config.r2_stream));
 	if ((result = init_r2_stream(config.r2_stream)) < 0)
 		return result;
 
@@ -459,19 +546,19 @@ static void downsample2(struct impl *this, const void *source)
 static int codec_fill_caps(const struct media_codec *codec, uint32_t flags,
 		const struct spa_dict *settings, uint8_t caps[A2DP_MAX_CAPS_SIZE])
 {
-	a2dp_aptx_adaptive_t adaptive_caps = { 0 };
+	a2dp_aptx_adaptive_t adaptive_caps;
 
 	(void)flags;
 	(void)settings;
 	if (!helper_available())
 		return -ENOTSUP;
 
-	adaptive_caps.info = codec->vendor;
-	adaptive_caps.sampling_freq =
+	adaptive_init_caps(&adaptive_caps, APTX_ADAPTIVE_R2_2_SUPPORTED_FEATURES,
 			APTX_ADAPTIVE_SAMPLING_FREQ_44100 |
 			APTX_ADAPTIVE_SAMPLING_FREQ_48000 |
-			APTX_ADAPTIVE_SAMPLING_FREQ_96000;
-	adaptive_caps.channel_mode = APTX_ADAPTIVE_CHANNEL_MODE_CAPABILITIES;
+			APTX_ADAPTIVE_SAMPLING_FREQ_96000,
+			APTX_ADAPTIVE_SOURCE_TYPE_2);
+	adaptive_caps.info = codec->vendor;
 	memcpy(caps, &adaptive_caps, sizeof(adaptive_caps));
 	return sizeof(adaptive_caps);
 }
@@ -482,39 +569,96 @@ static int codec_select_config(const struct media_codec *codec, uint32_t flags,
 		const struct spa_dict *settings, uint8_t config[A2DP_MAX_CAPS_SIZE],
 		void **config_data)
 {
-	a2dp_aptx_adaptive_t conf;
+	a2dp_aptx_adaptive_t peer;
+	a2dp_aptx_adaptive_t local;
+	a2dp_aptx_adaptive_t result;
 	const struct adaptive_rate *rate;
 	uint32_t requested_rate = info == NULL || info->rate == 0 ?
 			48000 : info->rate;
+	uint8_t common_freq;
+	uint8_t common_channels;
+	uint32_t peer_features;
+	uint32_t local_features;
+	uint32_t negotiated_features;
+	uint8_t negotiated_low;
+	bool peer_supports_r22;
 
 	(void)flags;
 	(void)settings;
 	(void)config_data;
-	if (caps == NULL || caps_size < sizeof(conf))
+	if (caps == NULL || caps_size < sizeof(peer))
 		return -EINVAL;
-	memcpy(&conf, caps, sizeof(conf));
+	memcpy(&peer, caps, sizeof(peer));
 
-	if (codec->vendor.vendor_id != conf.info.vendor_id ||
-			codec->vendor.codec_id != conf.info.codec_id)
+	if (codec->vendor.vendor_id != peer.info.vendor_id ||
+			codec->vendor.codec_id != peer.info.codec_id)
 		return -ENOTSUP;
 	if (!helper_available() || (rate = find_rate(requested_rate)) == NULL)
 		return -ENOTSUP;
-	if ((conf.sampling_freq & rate->codec_frequency) != rate->codec_frequency)
+
+	adaptive_init_caps(&local, APTX_ADAPTIVE_R2_2_SUPPORTED_FEATURES,
+			APTX_ADAPTIVE_SAMPLING_FREQ_44100 |
+			APTX_ADAPTIVE_SAMPLING_FREQ_48000 |
+			APTX_ADAPTIVE_SAMPLING_FREQ_96000,
+			APTX_ADAPTIVE_SOURCE_TYPE_2);
+	peer_features = adaptive_read_features(&peer);
+	peer_supports_r22 = peer.cap_ext_ver_num == APTX_ADAPTIVE_CAP_EXT_VER_NUM &&
+			(peer_features & APTX_ADAPTIVE_R2_2_SUPPORT_CAP) != 0;
+	if (!peer_supports_r22)
+		local.sampling_freq_source_type &=
+			(uint8_t)~APTX_ADAPTIVE_SAMPLING_FREQ_44100;
+	common_freq = adaptive_sampling_freq(&local) &
+			adaptive_sampling_freq(&peer);
+	if ((common_freq & rate->codec_frequency) != rate->codec_frequency) {
+		/* The monitor's default rate is a preference, not a hard capability.
+		 * As in the Qualcomm stack, fall back to the best common rate when the
+		 * preferred rate is absent from the peer. */
+		if (common_freq & APTX_ADAPTIVE_SAMPLING_FREQ_48000)
+			rate = find_rate(48000);
+		else if (common_freq & APTX_ADAPTIVE_SAMPLING_FREQ_44100)
+			rate = find_rate(44100);
+		else if (common_freq & APTX_ADAPTIVE_SAMPLING_FREQ_96000)
+			rate = find_rate(96000);
+		else
+			return -ENOTSUP;
+	}
+
+	common_channels = peer.channel_mode & local.channel_mode;
+	if (common_channels == 0)
 		return -ENOTSUP;
 
-	conf.sampling_freq = rate->codec_frequency;
-	if (conf.channel_mode & APTX_ADAPTIVE_CHANNEL_MODE_JOINT_STEREO)
-		conf.channel_mode = APTX_ADAPTIVE_CHANNEL_MODE_JOINT_STEREO;
-	else if (conf.channel_mode & APTX_ADAPTIVE_CHANNEL_MODE_STEREO)
-		conf.channel_mode = APTX_ADAPTIVE_CHANNEL_MODE_STEREO;
-	else
-		return -ENOTSUP;
 	if (info != NULL && info->channels != 0 &&
 			info->channels != APTX_ADAPTIVE_CHANNELS)
 		return -ENOTSUP;
 
-	memcpy(config, &conf, sizeof(conf));
-	return sizeof(conf);
+	result = local;
+	adaptive_set_sampling_freq(&result, rate->codec_frequency);
+	result.channel_mode = common_channels & APTX_ADAPTIVE_CHANNEL_MODE_STEREO ?
+			APTX_ADAPTIVE_CHANNEL_MODE_STEREO :
+			APTX_ADAPTIVE_CHANNEL_MODE_JOINT_STEREO;
+
+	/* Qualcomm negotiates the extension byte instead of blindly copying the
+	 * peer's record.  The high nibble is a feature advertisement and the low
+	 * nibble is an intersection of source and sink features. */
+	local_features = APTX_ADAPTIVE_R2_2_SUPPORTED_FEATURES;
+	if (peer.cap_ext_ver_num == 0) {
+		result.cap_ext_ver_num = 0;
+		memset(result.supported_features, 0,
+				sizeof(result.supported_features));
+		memset(result.setup_pref, 0, sizeof(result.setup_pref));
+		memset(result.eoc, 0, sizeof(result.eoc));
+	} else {
+		negotiated_low = (uint8_t)((((peer_features >> 4) |
+				(local_features >> 4)) << 4) |
+				((peer_features & local_features) & 0x0f));
+		negotiated_features = (peer_features & 0xffffff00u) |
+				negotiated_low;
+		result.cap_ext_ver_num = APTX_ADAPTIVE_CAP_EXT_VER_NUM;
+		adaptive_write_features(&result, negotiated_features);
+	}
+
+	memcpy(config, &result, sizeof(result));
+	return sizeof(result);
 }
 
 static int codec_enum_config(const struct media_codec *codec, uint32_t flags,
@@ -539,11 +683,12 @@ static int codec_enum_config(const struct media_codec *codec, uint32_t flags,
 	spa_pod_builder_add(b,
 			SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_audio),
 			SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-			/* S16 is listed first so 44.1 kHz can preserve the exact sample
-			 * word required by the Lossless candidate.  S32 remains available
-			 * for ordinary Adaptive/high-resolution streams. */
-			SPA_FORMAT_AUDIO_format, SPA_POD_CHOICE_ENUM_Id(3,
-					SPA_AUDIO_FORMAT_S16,
+			/* Qualcomm's source path uses 24-bit PCM.  S16 and S32 remain
+			 * accepted as explicit graph formats and are widened/narrowed to
+			 * the helper's Q27 CAPI input. */
+			SPA_FORMAT_AUDIO_format, SPA_POD_CHOICE_ENUM_Id(4,
+					SPA_AUDIO_FORMAT_S24_32,
+					SPA_AUDIO_FORMAT_S24_32,
 					SPA_AUDIO_FORMAT_S16,
 					SPA_AUDIO_FORMAT_S32),
 			SPA_FORMAT_AUDIO_channels, SPA_POD_Int(APTX_ADAPTIVE_CHANNELS),
@@ -556,7 +701,8 @@ static int codec_enum_config(const struct media_codec *codec, uint32_t flags,
 
 	for (size_t i = 0; i < SPA_N_ELEMENTS(adaptive_rates); ++i) {
 		const struct adaptive_rate *rate = &adaptive_rates[i];
-		if ((conf.sampling_freq & rate->codec_frequency) != rate->codec_frequency)
+		if ((adaptive_sampling_freq(&conf) & rate->codec_frequency) !=
+				rate->codec_frequency)
 			continue;
 		spa_pod_builder_int(b, (int)rate->graph_rate);
 		count++;
@@ -585,6 +731,7 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 		void *props, size_t mtu)
 {
 	struct impl *this;
+	a2dp_aptx_adaptive_t conf;
 	const struct adaptive_rate *rate;
 	uint32_t source_rate;
 
@@ -592,12 +739,29 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 	(void)flags;
 	(void)props;
 	if (config == NULL || config_len < sizeof(a2dp_aptx_adaptive_t) ||
-			info == NULL || info->media_type != SPA_MEDIA_TYPE_audio ||
+			info == NULL ||
+			info->media_type != SPA_MEDIA_TYPE_audio ||
 			info->media_subtype != SPA_MEDIA_SUBTYPE_raw ||
-				(info->info.raw.format != SPA_AUDIO_FORMAT_S16 &&
-					info->info.raw.format != SPA_AUDIO_FORMAT_S32) ||
+			(info->info.raw.format != SPA_AUDIO_FORMAT_S16 &&
+				info->info.raw.format != SPA_AUDIO_FORMAT_S24_32 &&
+				info->info.raw.format != SPA_AUDIO_FORMAT_S32) ||
 			info->info.raw.channels != APTX_ADAPTIVE_CHANNELS ||
 			!helper_available()) {
+		errno = ENOTSUP;
+		return NULL;
+	}
+	memcpy(&conf, config, sizeof(conf));
+	if (conf.info.vendor_id != APTX_ADAPTIVE_VENDOR_ID ||
+			conf.info.codec_id != APTX_ADAPTIVE_CODEC_ID ||
+			(adaptive_sampling_freq(&conf) != APTX_ADAPTIVE_SAMPLING_FREQ_44100 &&
+			 adaptive_sampling_freq(&conf) != APTX_ADAPTIVE_SAMPLING_FREQ_48000 &&
+			 adaptive_sampling_freq(&conf) != APTX_ADAPTIVE_SAMPLING_FREQ_96000) ||
+			(conf.channel_mode != APTX_ADAPTIVE_CHANNEL_MODE_STEREO &&
+			 conf.channel_mode != APTX_ADAPTIVE_CHANNEL_MODE_JOINT_STEREO)) {
+		errno = ENOTSUP;
+		return NULL;
+	}
+	if (info->info.raw.rate == 0) {
 		errno = ENOTSUP;
 		return NULL;
 	}
@@ -623,8 +787,11 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 	this->mode = get_helper_mode(source_rate);
 	this->profile = get_profile();
 	this->downsample2 = source_rate != rate->codec_rate;
-	this->input_s16 = info->info.raw.format == SPA_AUDIO_FORMAT_S16;
-	this->source_bytes = this->input_s16 ? sizeof(int16_t) : sizeof(int32_t);
+	this->pcm_format = info->info.raw.format == SPA_AUDIO_FORMAT_S16 ?
+			ADAPTIVE_PCM_S16 : info->info.raw.format == SPA_AUDIO_FORMAT_S24_32 ?
+			ADAPTIVE_PCM_S24_32 : ADAPTIVE_PCM_S32;
+	this->source_bytes = this->pcm_format == ADAPTIVE_PCM_S16 ?
+			sizeof(int16_t) : sizeof(int32_t);
 	this->lossless_mode = get_lossless_mode();
 	this->qhs_supported = get_qhs_supported();
 	this->abr_enabled = get_abr_enabled();
@@ -634,8 +801,9 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 	this->abr_pending_level = this->abr_level;
 
 	if (this->mode == APTX_ADAPTIVE_HELPER_MODE_R3 &&
-			(source_rate != 48000 || this->input_s16))
+			(source_rate != 48000 || this->pcm_format != ADAPTIVE_PCM_S32))
 		goto error;
+	build_r2_stream(&conf, this->r2_stream);
 	this->pid = spawn_helper(&this->input_fd, &this->output_fd);
 	if (this->pid < 0)
 		goto error;
@@ -660,12 +828,46 @@ static int codec_get_block_size(void *data)
 static int codec_start_encode(void *data, void *dst, size_t dst_size,
 		uint16_t seqnum, uint32_t timestamp)
 {
+	struct rtp_header *rtp;
+
 	(void)data;
-	(void)dst;
-	(void)dst_size;
-	(void)seqnum;
-	(void)timestamp;
-	return 0;
+	if (dst == NULL || dst_size < sizeof(*rtp))
+		return -ENOSPC;
+
+	rtp = dst;
+	memset(rtp, 0, sizeof(*rtp));
+	rtp->v = 2;
+	rtp->pt = 96;
+	rtp->sequence_number = htons(seqnum);
+	rtp->timestamp = htonl(timestamp);
+	return sizeof(*rtp);
+}
+
+static void convert_to_q27(struct impl *this, const void *source)
+{
+	const size_t sample_count = (size_t)this->source_frames *
+			APTX_ADAPTIVE_CHANNELS;
+
+	switch (this->pcm_format) {
+	case ADAPTIVE_PCM_S16: {
+		const int16_t *samples = source;
+		for (size_t i = 0; i < sample_count; ++i)
+			this->source_pcm[i] = (int32_t)((int64_t)samples[i] * 4096);
+		break;
+	}
+	case ADAPTIVE_PCM_S24_32: {
+		const int32_t *samples = source;
+		for (size_t i = 0; i < sample_count; ++i)
+			this->source_pcm[i] = (int32_t)((int64_t)samples[i] * 16);
+		break;
+	}
+	case ADAPTIVE_PCM_S32: {
+		const int32_t *samples = source;
+		for (size_t i = 0; i < sample_count; ++i)
+			this->source_pcm[i] = (int32_t)((int64_t)samples[i] >> 4);
+		break;
+	}
+	}
 }
 
 static int codec_encode(void *data, const void *src, size_t src_size,
@@ -677,7 +879,7 @@ static int codec_encode(void *data, const void *src, size_t src_size,
 	struct aptx_adaptive_ota_header header;
 	const uint8_t *payload;
 	size_t consumed;
-	const void *helper_src = src;
+	const void *helper_src;
 	int result;
 
 	if (src == NULL || src_size < (size_t)this->block_size ||
@@ -686,25 +888,16 @@ static int codec_encode(void *data, const void *src, size_t src_size,
 	if (dst_size == 0)
 		return -ENOSPC;
 
-	if (this->input_s16) {
-		const int16_t *samples = src;
-		size_t sample_count = (size_t)this->source_frames *
-				APTX_ADAPTIVE_CHANNELS;
-
-		/* The Qualcomm CAPI input is a signed S32/Q27 stream.  Multiplication
-		 * by 2^12 widens a signed 16-bit source exactly, without discarding
-		 * any source bit; the source word size is also sent in the helper's
-		 * Lossless feedback configuration. */
-		for (size_t i = 0; i < sample_count; ++i)
-			this->source_pcm[i] = (int32_t)samples[i] * (1 << 12);
-		helper_src = this->source_pcm;
-	}
+	/* AudioReach receives signed S32/Q27.  Convert all graph formats before
+	 * optional 2:1 rate conversion; sending SPA S32 values unchanged would
+	 * incorrectly present Q31 samples to a Q27 module. */
+	convert_to_q27(this, src);
+	helper_src = this->source_pcm;
 	if (this->downsample2) {
 		downsample2(this, helper_src);
 		helper_src = this->codec_pcm;
 	}
-	/* The helper's CAPI boundary is always S32/Q27, including widened S16
-	 * source audio. */
+	/* The helper's CAPI boundary is always S32/Q27. */
 	const size_t helper_bytes = APTX_ADAPTIVE_CODEC_BYTES;
 	write_u32le(request_size, (uint32_t)helper_bytes);
 	if ((result = write_full(this->input_fd, request_size, sizeof(request_size))) < 0 ||
@@ -736,10 +929,11 @@ static int codec_encode(void *data, const void *src, size_t src_size,
 	if (aptx_adaptive_next_ota_packet(this->packet, response_size, &header,
 			&payload, &consumed) < 0 || consumed != response_size)
 		return -EBADMSG;
-	/* A2DP sends one complete vendor packet per transport write.  Adaptive
-	 * OTA has no generic PipeWire fragmentation marker, so never hand a
-	 * packet larger than the negotiated L2CAP MTU to spa_bt_send(). */
-	if (this->mtu > 0 && response_size > (size_t)this->mtu)
+	/* A2DP sends one complete RTP packet per transport write.  The Qualcomm
+	 * Adaptive OTA header is the RTP payload, so account for both headers in
+	 * the negotiated L2CAP MTU. */
+	if (this->mtu > 0 && response_size + APTX_ADAPTIVE_RTP_HEADER_SIZE >
+			(size_t)this->mtu)
 		return -EMSGSIZE;
 	if (response_size > dst_size)
 		return -ENOSPC;
