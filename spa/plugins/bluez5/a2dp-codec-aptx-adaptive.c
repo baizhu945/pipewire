@@ -35,7 +35,8 @@
 #define APTX_ADAPTIVE_SYSROOT_ENV "PIPEWIRE_APTX_ADAPTIVE_SYSROOT"
 #define APTX_ADAPTIVE_MODE_ENV "PIPEWIRE_APTX_ADAPTIVE_MODE"
 #define APTX_ADAPTIVE_PROFILE_ENV "APTX_ADAPTIVE_PROFILE"
-#define APTX_ADAPTIVE_STREAM_ENV "APTX_ADAPTIVE_CONFIG_STREAM_HEX"
+#define APTX_ADAPTIVE_STREAM_OVERRIDE_ENV \
+	"APTX_ADAPTIVE_CONFIG_STREAM_OVERRIDE_HEX"
 #define APTX_ADAPTIVE_LOSSLESS_ENV "APTX_ADAPTIVE_LOSSLESS"
 #define APTX_ADAPTIVE_QHS_ENV "APTX_ADAPTIVE_QHS_SUPPORT"
 #define APTX_ADAPTIVE_ABR_ENV "APTX_ADAPTIVE_ABR"
@@ -427,7 +428,7 @@ static int hex_value(char value)
 
 static int init_r2_stream(uint8_t stream[APTX_ADAPTIVE_HELPER_R2_STREAM_SIZE])
 {
-	const char *value = getenv(APTX_ADAPTIVE_STREAM_ENV);
+	const char *value = getenv(APTX_ADAPTIVE_STREAM_OVERRIDE_ENV);
 
 	if (value == NULL)
 		return 0;
@@ -468,9 +469,10 @@ static int initialize_helper(struct impl *this, const uint8_t *codec_config,
 	config.mtu = this->mtu > (int)APTX_ADAPTIVE_RTP_HEADER_SIZE ?
 			(uint32_t)this->mtu - APTX_ADAPTIVE_RTP_HEADER_SIZE : 0u;
 	config.abr_enabled = this->abr_enabled ? 1u : 0u;
-	/* The helper boundary is always S32/Q27.  Source bit depth is not an
-	 * OTA capability and is deliberately not used while Lossless is disabled. */
-	config.bits_per_sample = 32u;
+	/* The helper boundary is always S32/Q27, but the original source word size
+	 * is part of the 2.2 lossless state machine.  Preserve it when PipeWire
+	 * supplied S16; S24_32 and S32 remain the ordinary 32-bit CAPI path. */
+	config.bits_per_sample = this->pcm_format == ADAPTIVE_PCM_S16 ? 16u : 32u;
 	config.lossless_mode = this->lossless_mode;
 	config.qhs_supported = this->qhs_supported ? 1u : 0u;
 	config.cie_size = APTX_ADAPTIVE_HELPER_CIE_SIZE;
