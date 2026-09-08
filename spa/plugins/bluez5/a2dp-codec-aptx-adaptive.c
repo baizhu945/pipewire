@@ -6,12 +6,14 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <spa/param/audio/format.h>
@@ -53,6 +55,17 @@
 
 #define APTX_ADAPTIVE_ABR_LEVELS 5u
 #define APTX_ADAPTIVE_ABR_CONFIRMATIONS 3u
+
+/* Upper bound for a single helper reply.  The helper answers in well under a
+ * millisecond; this only protects the data thread from a stuck emulator. */
+#define APTX_ADAPTIVE_HELPER_READ_TIMEOUT_MS 1000
+
+static int64_t now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 /* A causal 2:1 half-band filter.  It is used only for 88.2->44.1 and
  * 192->96 graph formats, because the available Qualcomm CAPI build accepts
@@ -244,6 +257,11 @@ static enum aptx_adaptive_helper_lossless_mode get_lossless_mode(void)
 	return APTX_ADAPTIVE_HELPER_LOSSLESS_OFF;
 }
 
+static bool lossless_enabled(void)
+{
+	return get_lossless_mode() != APTX_ADAPTIVE_HELPER_LOSSLESS_OFF;
+}
+
 static bool get_qhs_supported(void)
 {
 	const char *value = getenv(APTX_ADAPTIVE_QHS_ENV);
@@ -283,12 +301,33 @@ static bool helper_available(void)
 static int read_full(int fd, void *data, size_t size)
 {
 	uint8_t *p = data;
+	/* The helper runs inside a user-mode CPU emulator.  A stuck emulator must
+	 * not block the PipeWire data thread forever, so bound every read with a
+	 * deadline that is far longer than the normal sub-millisecond response. */
+	int64_t deadline = now_ms() + APTX_ADAPTIVE_HELPER_READ_TIMEOUT_MS;
+
 	while (size > 0) {
-		ssize_t n = read(fd, p, size);
+		struct pollfd pfd = { .fd = fd, .events = POLLIN };
+		int64_t remaining = deadline - now_ms();
+		ssize_t n;
+		int ret;
+
+		if (remaining <= 0)
+			return -ETIMEDOUT;
+		ret = poll(&pfd, 1, (int)SPA_MIN(remaining, (int64_t)INT_MAX));
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			return -errno;
+		}
+		if (ret == 0)
+			return -ETIMEDOUT;
+
+		n = read(fd, p, size);
 		if (n == 0)
 			return -EPIPE;
 		if (n < 0) {
-			if (errno == EINTR)
+			if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
 				continue;
 			return -errno;
 		}
@@ -671,6 +710,15 @@ static int codec_select_config(const struct media_codec *codec, uint32_t flags,
 		negotiated_low = (uint8_t)((((peer_features >> 4) |
 				(local_features >> 4)) << 4) |
 				((peer_features & local_features) & 0x0f));
+		/* The capability bit above is only a peer advertisement that the
+		 * arithmetic above copies into the negotiated record.  When Lossless
+		 * is disabled the bridge must not present it to the encoder: the
+		 * proprietary R2.2 wrapper then enters its Lossless candidate state
+		 * at 44.1 kHz and waits for QHS/16-bit sideband feedback that this
+		 * bridge never sends, which stalls the stream after a few packets. */
+		if (!lossless_enabled())
+			negotiated_low &=
+				(uint8_t)~APTX_ADAPTIVE_R2_2_SUPPORT_CAP;
 		negotiated_features = (peer_features & 0xffffff00u) |
 				negotiated_low;
 		result.cap_ext_ver_num = APTX_ADAPTIVE_CAP_EXT_VER_NUM;
@@ -826,13 +874,26 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 			this->source_bytes);
 	this->abr_level = APTX_ADAPTIVE_ABR_LEVELS - 1;
 	this->abr_pending_level = this->abr_level;
-	if (log_ != NULL)
+	if (log_ != NULL) {
 		spa_log_info(log_,
 				"aptX Adaptive encoder init: source-rate=%u codec-rate=%u "
 				"format=%d block=%d mtu=%d mode=%d lossless=%d qhs=%d",
 				this->source_rate, this->codec_rate, this->pcm_format,
 				this->block_size, this->mtu, this->mode,
 				this->lossless_mode, this->qhs_supported);
+		if (this->abr_enabled)
+			spa_log_info(log_,
+					"aptX Adaptive ABR enabled, but this encoder build "
+					"does not honour quality-level feedback in the "
+					"standalone helper; the stream stays at a fixed "
+					"rate (measured: ~212 kbps R2 at 48 kHz)");
+		if (this->lossless_mode != APTX_ADAPTIVE_HELPER_LOSSLESS_OFF)
+			spa_log_warn(log_,
+					"aptX Adaptive Lossless is experimental: it requires "
+					"QHS feedback from a Qualcomm controller that this "
+					"bridge cannot provide, and the standalone helper "
+					"stalls on the 44.1 kHz Lossless candidate path");
+	}
 
 	if (this->mode == APTX_ADAPTIVE_HELPER_MODE_R3 &&
 			(source_rate != 48000 || this->pcm_format != ADAPTIVE_PCM_S32))
@@ -1001,6 +1062,12 @@ static int codec_abr_process(void *data, size_t unsent)
 	uint32_t quality_level;
 	int result;
 
+	/* NOTE: this control plane is wired exactly like the Qualcomm stack, but
+	 * the R2.2 CAPI build used here ignores IMCL quality-level feedback when it
+	 * runs without a full AudioReach container.  Measurements show identical
+	 * output for level 1 and level 5, so the stream is effectively fixed-rate.
+	 * The code is kept because the helper protocol is still exercised and a
+	 * different encoder build may honour it. */
 	if (!this->abr_enabled)
 		return 0;
 
