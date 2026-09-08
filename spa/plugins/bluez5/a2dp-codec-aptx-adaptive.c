@@ -917,12 +917,9 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 					"pipeline; QHS sideband feedback is not required");
 	}
 
-	/* The direct R3 pipeline drives the codec library itself and works at
-	 * 44.1/48/96 kHz; only the PCM word size is fixed (the R3 encoder takes
-	 * the same 32-bit Q27 stream the CAPI module does). */
-	if (this->mode == APTX_ADAPTIVE_HELPER_MODE_R3 &&
-			this->pcm_format != ADAPTIVE_PCM_S32)
-		goto error;
+	/* convert_to_q27() normalises every supported source format to the 32-bit
+	 * Q27 stream the direct R3 pipeline consumes, so R3 works at 44.1/48/96 kHz
+	 * for S16, S24_32 and S32 sources alike. */
 	build_r2_stream(&conf, this->r2_stream);
 	this->pid = spawn_helper(&this->input_fd, &this->output_fd);
 	if (this->pid < 0)
