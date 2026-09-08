@@ -47,6 +47,10 @@
 #define APTX_ADAPTIVE_CHANNELS 2u
 #define APTX_ADAPTIVE_HELPER_BITS_PER_SAMPLE 32u
 #define APTX_ADAPTIVE_CODEC_FRAMES 672u
+/* The direct R3 pipeline consumes 720 samples per frame (measured at 44.1/48/96
+ * kHz): with 672-sample blocks the encoder's window drains 48 samples per call
+ * and half the calls return EAGAIN. */
+#define APTX_ADAPTIVE_R3_CODEC_FRAMES 720u
 #define APTX_ADAPTIVE_CODEC_BYTES \
 	(APTX_ADAPTIVE_CHANNELS * (APTX_ADAPTIVE_HELPER_BITS_PER_SAMPLE / 8u) * \
 	 APTX_ADAPTIVE_CODEC_FRAMES)
@@ -190,6 +194,8 @@ struct impl {
 	uint32_t source_rate;
 	uint32_t codec_rate;
 	uint32_t source_frames;
+	uint32_t codec_frames;
+	size_t helper_bytes;
 	int block_size;
 	int mtu;
 	enum aptx_adaptive_helper_mode mode;
@@ -204,7 +210,7 @@ struct impl {
 	int32_t downsample_history[APTX_ADAPTIVE_CHANNELS]
 		[APTX_ADAPTIVE_DOWNSAMPLE_HISTORY];
 	int32_t source_pcm[APTX_ADAPTIVE_MAX_SOURCE_FRAMES * APTX_ADAPTIVE_CHANNELS];
-	int32_t codec_pcm[APTX_ADAPTIVE_CODEC_FRAMES * APTX_ADAPTIVE_CHANNELS];
+	int32_t codec_pcm[APTX_ADAPTIVE_MAX_SOURCE_FRAMES * APTX_ADAPTIVE_CHANNELS];
 	uint8_t packet[APTX_ADAPTIVE_MAX_PACKET_SIZE];
 
 	bool abr_enabled;
@@ -604,7 +610,7 @@ static void downsample2(struct impl *this, const void *source)
 	const uint32_t source_frames = this->source_frames;
 
 	for (uint32_t output_frame = 0;
-			output_frame < APTX_ADAPTIVE_CODEC_FRAMES; ++output_frame) {
+			output_frame < this->codec_frames; ++output_frame) {
 		int source_index = (int)(output_frame * 2u);
 		for (unsigned int channel = 0; channel < APTX_ADAPTIVE_CHANNELS; ++channel) {
 			int64_t sum = 0;
@@ -880,10 +886,14 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 	this->output_fd = -1;
 	this->source_rate = source_rate;
 	this->codec_rate = rate->codec_rate;
-	this->source_frames = APTX_ADAPTIVE_CODEC_FRAMES *
-			(source_rate == rate->codec_rate ? 1u : 2u);
-	this->mtu = mtu > 0 ? (int)mtu : 995;
 	this->mode = get_helper_mode(source_rate);
+	this->codec_frames = this->mode == APTX_ADAPTIVE_HELPER_MODE_R3 ?
+			APTX_ADAPTIVE_R3_CODEC_FRAMES : APTX_ADAPTIVE_CODEC_FRAMES;
+	this->source_frames = this->codec_frames *
+			(source_rate == rate->codec_rate ? 1u : 2u);
+	this->helper_bytes = APTX_ADAPTIVE_CHANNELS *
+			(APTX_ADAPTIVE_HELPER_BITS_PER_SAMPLE / 8u) * this->codec_frames;
+	this->mtu = mtu > 0 ? (int)mtu : 995;
 	this->profile = get_profile();
 	this->downsample2 = source_rate != rate->codec_rate;
 	this->pcm_format = info->info.raw.format == SPA_AUDIO_FORMAT_S16 ?
@@ -1015,7 +1025,7 @@ static int codec_encode(void *data, const void *src, size_t src_size,
 		helper_src = this->codec_pcm;
 	}
 	/* The helper's CAPI boundary is always S32/Q27. */
-	const size_t helper_bytes = APTX_ADAPTIVE_CODEC_BYTES;
+	const size_t helper_bytes = this->helper_bytes;
 	write_u32le(request_size, (uint32_t)helper_bytes);
 	if ((result = write_full(this->input_fd, request_size, sizeof(request_size))) < 0 ||
 			(result = write_full(this->input_fd, helper_src,
