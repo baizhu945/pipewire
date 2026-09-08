@@ -912,15 +912,16 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 					"standalone helper; the stream stays at a fixed "
 					"rate (measured: ~212 kbps R2 at 48 kHz)");
 		if (this->lossless_mode != APTX_ADAPTIVE_HELPER_LOSSLESS_OFF)
-			spa_log_warn(log_,
-					"aptX Adaptive Lossless is experimental: it requires "
-					"QHS feedback from a Qualcomm controller that this "
-					"bridge cannot provide, and the standalone helper "
-					"stalls on the 44.1 kHz Lossless candidate path");
+			spa_log_info(log_,
+					"aptX Adaptive Lossless uses the direct R3 encoding "
+					"pipeline; QHS sideband feedback is not required");
 	}
 
+	/* The direct R3 pipeline drives the codec library itself and works at
+	 * 44.1/48/96 kHz; only the PCM word size is fixed (the R3 encoder takes
+	 * the same 32-bit Q27 stream the CAPI module does). */
 	if (this->mode == APTX_ADAPTIVE_HELPER_MODE_R3 &&
-			(source_rate != 48000 || this->pcm_format != ADAPTIVE_PCM_S32))
+			this->pcm_format != ADAPTIVE_PCM_S32)
 		goto error;
 	build_r2_stream(&conf, this->r2_stream);
 	this->pid = spawn_helper(&this->input_fd, &this->output_fd);
