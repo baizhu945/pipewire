@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -380,8 +381,31 @@ static void close_fds(int input_fd, int output_fd)
 static void reap_helper(pid_t pid)
 {
 	int wait_status;
+	unsigned int i;
+
 	if (pid <= 0)
 		return;
+	/* Closing the pipes normally makes the helper exit.  A stuck emulator must
+	 * not block the caller forever, so give it a short grace period and then
+	 * terminate it.  This runs from the data thread when init fails. */
+	for (i = 0; i < 50; ++i) {
+		pid_t r = waitpid(pid, &wait_status, WNOHANG);
+		if (r == pid)
+			return;
+		if (r < 0 && errno != EINTR)
+			return;
+		usleep(20000);
+	}
+	kill(pid, SIGTERM);
+	for (i = 0; i < 25; ++i) {
+		pid_t r = waitpid(pid, &wait_status, WNOHANG);
+		if (r == pid)
+			return;
+		if (r < 0 && errno != EINTR)
+			return;
+		usleep(20000);
+	}
+	kill(pid, SIGKILL);
 	while (waitpid(pid, &wait_status, 0) < 0 && errno == EINTR)
 		;
 }
