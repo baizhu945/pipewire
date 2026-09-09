@@ -722,9 +722,19 @@ static int codec_select_config(const struct media_codec *codec, uint32_t flags,
 
 	result = local;
 	adaptive_set_sampling_freq(&result, rate->codec_frequency);
-	result.channel_mode = common_channels & APTX_ADAPTIVE_CHANNEL_MODE_STEREO ?
-			APTX_ADAPTIVE_CHANNEL_MODE_STEREO :
-			APTX_ADAPTIVE_CHANNEL_MODE_JOINT_STEREO;
+	/* The MOMENTUM 5 advertises both STEREO (0x02) and JOINT_STEREO (0x08) but
+	 * only consumes a JOINT_STEREO stream; prefer JOINT_STEREO and keep an
+	 * env override so the choice can be flipped without a rebuild. */
+	{
+		const char *cm = getenv("APTX_ADAPTIVE_CHANNEL_MODE");
+		bool want_joint = cm == NULL || !spa_streq(cm, "stereo");
+		uint32_t prefer = want_joint ? APTX_ADAPTIVE_CHANNEL_MODE_JOINT_STEREO :
+				APTX_ADAPTIVE_CHANNEL_MODE_STEREO;
+		uint32_t fallback = want_joint ? APTX_ADAPTIVE_CHANNEL_MODE_STEREO :
+				APTX_ADAPTIVE_CHANNEL_MODE_JOINT_STEREO;
+
+		result.channel_mode = (common_channels & prefer) ? prefer : fallback;
+	}
 
 	/* Qualcomm negotiates the extension byte instead of blindly copying the
 	 * peer's record.  The high nibble is a feature advertisement and the low
