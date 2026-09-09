@@ -698,6 +698,17 @@ static int codec_select_config(const struct media_codec *codec, uint32_t flags,
 			(uint8_t)~APTX_ADAPTIVE_SAMPLING_FREQ_44100;
 	common_freq = adaptive_sampling_freq(&local) &
 			adaptive_sampling_freq(&peer);
+	/* aptX Lossless is a 44.1 kHz codec.  The MOMENTUM 5 only consumes a
+	 * Lossless stream at 44.1 kHz; at 48 kHz it silently stops reading after
+	 * ~1 s (observed: A2DP write returns EAGAIN and the link stalls at
+	 * ~11 B/s).  Force 44.1 kHz whenever Lossless is enabled and the peer
+	 * advertises R2.2 support. */
+	if (lossless_enabled() && peer_supports_r22 &&
+			(common_freq & APTX_ADAPTIVE_SAMPLING_FREQ_44100)) {
+		const struct adaptive_rate *lossless_rate = find_rate(44100);
+		if (lossless_rate != NULL)
+			rate = lossless_rate;
+	}
 	if ((common_freq & rate->codec_frequency) != rate->codec_frequency) {
 		/* The monitor's default rate is a preference, not a hard capability.
 		 * As in the Qualcomm stack, fall back to the best common rate when the
