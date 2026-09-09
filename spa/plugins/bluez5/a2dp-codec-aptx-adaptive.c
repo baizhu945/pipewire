@@ -832,6 +832,14 @@ static int codec_select_config(const struct media_codec *codec, uint32_t flags,
 				(uint8_t)~APTX_ADAPTIVE_R2_2_SUPPORT_CAP;
 		negotiated_features = (peer_features & 0xffffff00u) |
 				negotiated_low;
+		/* Diagnostic override: the Android source talking to this host sends
+		 * its own feature word (0x0f000017) rather than this intersection, so
+		 * allow pinning it to find what the sink actually needs. */
+		{
+			const char *fe = getenv("APTX_ADAPTIVE_FEATURES");
+			if (fe != NULL && *fe != '\0')
+				negotiated_features = (uint32_t)strtoul(fe, NULL, 0);
+		}
 		result.cap_ext_ver_num = APTX_ADAPTIVE_CAP_EXT_VER_NUM;
 		adaptive_write_features(&result, negotiated_features);
 	}
