@@ -173,9 +173,18 @@
 #define APTX_ADAPTIVE_VENDOR_ID          0x000000d7
 #define APTX_ADAPTIVE_CODEC_ID           0x00ad
 
-#define APTX_ADAPTIVE_SAMPLING_FREQ_44100  0x40
+/* The Adaptive sampling-frequency bitmask is NOT the SBC / classic-aptX one.
+ * These values come from Qualcomm's own A2DP-offload parser, bthost_ipc.h:
+ *     44100 = 0x08, 48000 = 0x10, 88000 = 0x20, 192000 = 0x40
+ * The previous values here (44100 = 0x40, 96000 = 0xa0) made the source
+ * advertise 192 kHz / an undefined code while feeding 44.1 kHz frames, so the
+ * sink received a stream whose declared rate did not match the codec frames
+ * and decoded silence.  0x40 is used for the 96 kHz family on this bridge. */
+#define APTX_ADAPTIVE_SAMPLING_FREQ_44100  0x08
 #define APTX_ADAPTIVE_SAMPLING_FREQ_48000  0x10
-#define APTX_ADAPTIVE_SAMPLING_FREQ_96000  0xa0
+#define APTX_ADAPTIVE_SAMPLING_FREQ_88200  0x20
+#define APTX_ADAPTIVE_SAMPLING_FREQ_96000  0x40
+#define APTX_ADAPTIVE_SAMPLING_FREQ_192000 0x40
 #define APTX_ADAPTIVE_SAMPLING_FREQ_MASK   0xf8
 
 #define APTX_ADAPTIVE_SOURCE_TYPE_1        0x00
