@@ -929,6 +929,18 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 	this->mode = get_helper_mode(source_rate);
 	this->codec_frames = this->mode == APTX_ADAPTIVE_HELPER_MODE_R3 ?
 			APTX_ADAPTIVE_R3_CODEC_FRAMES : APTX_ADAPTIVE_CODEC_FRAMES;
+	/* Diagnostic override: the R2 wrapper's real frame length has to match the
+	 * block size fed to the helper, otherwise the encoder emits a packet only
+	 * every other call and the RTP timestamp jumps.  Allow measuring it
+	 * without a rebuild. */
+	{
+		const char *cf = getenv("APTX_ADAPTIVE_CODEC_FRAMES");
+		if (cf != NULL && *cf != '\0') {
+			unsigned long v = strtoul(cf, NULL, 0);
+			if (v >= 64 && v <= APTX_ADAPTIVE_MAX_SOURCE_FRAMES)
+				this->codec_frames = (uint32_t)v;
+		}
+	}
 	this->source_frames = this->codec_frames *
 			(source_rate == rate->codec_rate ? 1u : 2u);
 	this->helper_bytes = APTX_ADAPTIVE_CHANNELS *
