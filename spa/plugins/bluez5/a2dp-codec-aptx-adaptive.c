@@ -1177,17 +1177,28 @@ static int codec_encode(void *data, const void *src, size_t src_size,
 	if (aptx_adaptive_next_ota_packet(this->packet, response_size, &header,
 			&payload, &consumed) < 0 || consumed != response_size)
 		return -EBADMSG;
-	/* A2DP sends one complete RTP packet per transport write.  The Qualcomm
-	 * Adaptive OTA header is the RTP payload, so account for both headers in
-	 * the negotiated L2CAP MTU. */
-	if (this->mtu > 0 && response_size + APTX_ADAPTIVE_RTP_HEADER_SIZE >
+	/* The R2 CAPI output has an eight-byte host/container OTA prefix, but the
+	 * Android reference source sends the 656-byte Adaptive codec frame itself
+	 * as the RTP payload (the sink callback receives frames beginning 83 00,
+	 * with no extra TTP/version prefix).  Keep the old behaviour available for
+	 * R3/Lossless, while allowing the ordinary R2 path to strip that wrapper
+	 * before it reaches A2DP. */
+	const uint8_t *wire_data = this->packet;
+	size_t wire_size = response_size;
+	if (this->mode == APTX_ADAPTIVE_HELPER_MODE_R2 &&
+			getenv("APTX_ADAPTIVE_STRIP_OTA") != NULL) {
+		wire_data = payload;
+		wire_size = response_size - (size_t)(payload - this->packet);
+	}
+	/* A2DP sends one complete RTP packet per transport write. */
+	if (this->mtu > 0 && wire_size + APTX_ADAPTIVE_RTP_HEADER_SIZE >
 			(size_t)this->mtu)
 		return -EMSGSIZE;
-	if (response_size > dst_size)
+	if (wire_size > dst_size)
 		return -ENOSPC;
 
-	memcpy(dst, this->packet, response_size);
-	*dst_out = response_size;
+	memcpy(dst, wire_data, wire_size);
+	*dst_out = wire_size;
 	*need_flush = NEED_FLUSH_ALL;
 	return this->block_size;
 }
