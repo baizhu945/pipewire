@@ -5,6 +5,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
 #include <signal.h>
@@ -897,14 +898,23 @@ static int codec_decode(void *data, const void *src, size_t src_size,
 		void *dst, size_t dst_size, size_t *dst_out)
 {
 	struct impl *this = data;
+	static int fd = -2;
 
 	(void)this;
-	(void)src;
 	(void)dst;
 	(void)dst_size;
-	/* Capture-only sink: report the whole payload as consumed so the A2DP
-	 * stream keeps running, and produce no audio.  The aptX Adaptive payload
-	 * itself is what we want, and it is already visible on HCI. */
+	/* Capture-only sink: dump the decrypted aptX Adaptive payload so a
+	 * reference bitstream from a working source can be compared with the
+	 * one this host produces.  The data is already decrypted by the time it
+	 * reaches this callback, which is exactly why this path is used instead
+	 * of trying to decrypt an HCI capture. */
+	if (fd == -2) {
+		const char *path = getenv("APTX_ADAPTIVE_CAPTURE");
+		fd = (path != NULL && *path != '\0') ?
+				open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644) : -1;
+	}
+	if (fd >= 0 && src != NULL && src_size > 0)
+		(void)write(fd, src, src_size);
 	if (dst_out)
 		*dst_out = 0;
 	return (int)src_size;
