@@ -153,6 +153,12 @@ static void adaptive_set_sampling_freq(a2dp_aptx_adaptive_t *caps,
 static void adaptive_init_caps(a2dp_aptx_adaptive_t *caps,
 		uint32_t features, uint8_t sampling_freq, uint8_t source_type)
 {
+	/* Diagnostic override: match a working peer configuration exactly.
+	 * APTX_ADAPTIVE_SOURCE_TYPE_1 (0x00) is what an Android source
+	 * advertises; the stock default here is SOURCE_TYPE_2 (0x02). */
+	const char *st = getenv("APTX_ADAPTIVE_SOURCE_TYPE");
+	if (st != NULL && *st != '\0')
+		source_type = (uint8_t)strtoul(st, NULL, 0);
 	memset(caps, 0, sizeof(*caps));
 	caps->info.vendor_id = APTX_ADAPTIVE_VENDOR_ID;
 	caps->info.codec_id = APTX_ADAPTIVE_CODEC_ID;
