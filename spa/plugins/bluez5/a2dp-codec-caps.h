@@ -173,18 +173,16 @@
 #define APTX_ADAPTIVE_VENDOR_ID          0x000000d7
 #define APTX_ADAPTIVE_CODEC_ID           0x00ad
 
-/* The Adaptive sampling-frequency bitmask is NOT the SBC / classic-aptX one.
- * These values come from Qualcomm's own A2DP-offload parser, bthost_ipc.h:
- *     44100 = 0x08, 48000 = 0x10, 88000 = 0x20, 192000 = 0x40
- * The previous values here (44100 = 0x40, 96000 = 0xa0) made the source
- * advertise 192 kHz / an undefined code while feeding 44.1 kHz frames, so the
- * sink received a stream whose declared rate did not match the codec frames
- * and decoded silence.  0x40 is used for the 96 kHz family on this bridge. */
-#define APTX_ADAPTIVE_SAMPLING_FREQ_44100  0x08
+/* The Adaptive sampling-frequency field.  These values are taken from the
+ * working Android source (HONOR 90GT) captured with the MOMENTUM 5 as the
+ * peer: the phone's SET_CONFIG uses 0x40 for its 44.1 kHz default, the
+ * headphone capability record advertises 0x71 (rate bits 0x70 = 48k/96k/
+ * 44.1k plus source-type 0x01).  Qualcomm's A2DP-offload parser in
+ * bthost_ipc.h uses a different numbering (44100=0x08, 192000=0x40) for
+ * its own DSP payload and must not be copied here. */
+#define APTX_ADAPTIVE_SAMPLING_FREQ_44100  0x40
 #define APTX_ADAPTIVE_SAMPLING_FREQ_48000  0x10
-#define APTX_ADAPTIVE_SAMPLING_FREQ_88200  0x20
-#define APTX_ADAPTIVE_SAMPLING_FREQ_96000  0x40
-#define APTX_ADAPTIVE_SAMPLING_FREQ_192000 0x40
+#define APTX_ADAPTIVE_SAMPLING_FREQ_96000  0x20
 #define APTX_ADAPTIVE_SAMPLING_FREQ_MASK   0xf8
 
 #define APTX_ADAPTIVE_SOURCE_TYPE_1        0x00

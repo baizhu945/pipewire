@@ -236,6 +236,25 @@ static const struct adaptive_rate *find_rate(uint32_t rate)
 	return NULL;
 }
 
+/* The R2 CAPI wrapper emits one OTA packet per fixed-duration frame.  Measured
+ * against the CPH2749 module: 1102.8 samples at 44.1 kHz (25 ms), 1200 at
+ * 48 kHz (25 ms) and 1923.7 at 96 kHz (20 ms).  The block handed to the helper
+ * must track the frame length, otherwise the wrapper only produces a packet
+ * every other call and the RTP timestamp drifts against the codec frames. */
+static uint32_t r2_frames_for_rate(uint32_t rate)
+{
+	switch (rate) {
+	case 44100:
+		return 1102;
+	case 48000:
+		return 1200;
+	case 96000:
+		return 1920;
+	default:
+		return APTX_ADAPTIVE_CODEC_FRAMES;
+	}
+}
+
 static enum aptx_adaptive_helper_mode get_helper_mode(uint32_t source_rate)
 {
 	const char *value = getenv(APTX_ADAPTIVE_MODE_ENV);
@@ -1013,7 +1032,8 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 	this->codec_rate = rate->codec_rate;
 	this->mode = get_helper_mode(source_rate);
 	this->codec_frames = this->mode == APTX_ADAPTIVE_HELPER_MODE_R3 ?
-			APTX_ADAPTIVE_R3_CODEC_FRAMES : APTX_ADAPTIVE_CODEC_FRAMES;
+			APTX_ADAPTIVE_R3_CODEC_FRAMES :
+			r2_frames_for_rate(this->codec_rate);
 	/* Diagnostic override: the R2 wrapper's real frame length has to match the
 	 * block size fed to the helper, otherwise the encoder emits a packet only
 	 * every other call and the RTP timestamp jumps.  Allow measuring it
