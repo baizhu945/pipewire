@@ -196,6 +196,7 @@ struct impl {
 	pid_t pid;
 	int input_fd;
 	int output_fd;
+	bool sink;
 
 	uint32_t source_rate;
 	uint32_t codec_rate;
@@ -641,8 +642,12 @@ static int codec_fill_caps(const struct media_codec *codec, uint32_t flags,
 {
 	a2dp_aptx_adaptive_t adaptive_caps;
 
-	(void)flags;
 	(void)settings;
+	/* The sink role only needs the capability blob to be advertised so that an
+	 * Android source will negotiate aptX Adaptive towards this host; the media
+	 * packets are captured at the HCI level by btmon, so decoding is not
+	 * required for that use case.  Advertise the same set either way. */
+	(void)flags;
 	if (!helper_available())
 		return -ENOTSUP;
 
@@ -871,6 +876,40 @@ static void codec_deinit(void *data)
 	free(this);
 }
 
+static int codec_start_decode(void *data, const void *src, size_t src_size,
+		uint16_t *seqnum, uint32_t *timestamp)
+{
+	struct impl *this = data;
+	const struct rtp_header *header = src;
+	const size_t header_size = sizeof(struct rtp_header);
+
+	(void)this;
+	if (src == NULL || src_size <= header_size)
+		return -EINVAL;
+	if (seqnum)
+		*seqnum = ntohs(header->sequence_number);
+	if (timestamp)
+		*timestamp = ntohl(header->timestamp);
+	return (int)header_size;
+}
+
+static int codec_decode(void *data, const void *src, size_t src_size,
+		void *dst, size_t dst_size, size_t *dst_out)
+{
+	struct impl *this = data;
+
+	(void)this;
+	(void)src;
+	(void)dst;
+	(void)dst_size;
+	/* Capture-only sink: report the whole payload as consumed so the A2DP
+	 * stream keeps running, and produce no audio.  The aptX Adaptive payload
+	 * itself is what we want, and it is already visible on HCI. */
+	if (dst_out)
+		*dst_out = 0;
+	return (int)src_size;
+}
+
 static void *codec_init(const struct media_codec *codec, uint32_t flags,
 		void *config, size_t config_len, const struct spa_audio_info *info,
 		void *props, size_t mtu)
@@ -881,7 +920,6 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 	uint32_t source_rate;
 
 	(void)codec;
-	(void)flags;
 	(void)props;
 	if (config == NULL || config_len < sizeof(a2dp_aptx_adaptive_t) ||
 			info == NULL ||
@@ -890,8 +928,29 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 			(info->info.raw.format != SPA_AUDIO_FORMAT_S16 &&
 				info->info.raw.format != SPA_AUDIO_FORMAT_S24_32 &&
 				info->info.raw.format != SPA_AUDIO_FORMAT_S32) ||
-			info->info.raw.channels != APTX_ADAPTIVE_CHANNELS ||
-			!helper_available()) {
+			info->info.raw.channels != APTX_ADAPTIVE_CHANNELS) {
+		errno = ENOTSUP;
+		return NULL;
+	}
+	if ((flags & MEDIA_CODEC_FLAG_SINK) != 0) {
+		/* Capture-only sink: the stream must be accepted and consumed so the
+		 * source keeps sending, but the payload is deliberately discarded.
+		 * btmon sees the packets on the HCI interface regardless. */
+		this = calloc(1, sizeof(*this));
+		if (this == NULL)
+			return NULL;
+		this->pid = -1;
+		this->input_fd = -1;
+		this->output_fd = -1;
+		this->sink = true;
+		this->mtu = mtu;
+		this->pcm_format = info->info.raw.format == SPA_AUDIO_FORMAT_S16 ?
+				ADAPTIVE_PCM_S16 :
+				(info->info.raw.format == SPA_AUDIO_FORMAT_S24_32 ?
+				 ADAPTIVE_PCM_S24_32 : ADAPTIVE_PCM_S32);
+		return this;
+	}
+	if (!helper_available()) {
 		errno = ENOTSUP;
 		return NULL;
 	}
@@ -1216,6 +1275,8 @@ const struct media_codec a2dp_codec_aptx_adaptive = {
 	.abr_process = codec_abr_process,
 	.start_encode = codec_start_encode,
 	.encode = codec_encode,
+	.start_decode = codec_start_decode,
+	.decode = codec_decode,
 	.get_delay = codec_get_delay,
 	.set_log = codec_set_log,
 };
