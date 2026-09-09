@@ -685,6 +685,19 @@ static int codec_select_config(const struct media_codec *codec, uint32_t flags,
 	if (!helper_available() || (rate = find_rate(requested_rate)) == NULL)
 		return -ENOTSUP;
 
+	/* Diagnostic override: pin the negotiated codec rate regardless of the
+	 * graph rate.  Useful to replicate a working peer configuration (e.g. the
+	 * MOMENTUM 5 with an Android source at 44.1 kHz) without touching the
+	 * PipeWire clock. */
+	{
+		const char *forced = getenv("APTX_ADAPTIVE_FORCE_RATE");
+		if (forced != NULL && *forced != '\0') {
+			const struct adaptive_rate *r = find_rate((uint32_t)atoi(forced));
+			if (r != NULL)
+				rate = r;
+		}
+	}
+
 	adaptive_init_caps(&local, APTX_ADAPTIVE_R2_2_SUPPORTED_FEATURES,
 			APTX_ADAPTIVE_SAMPLING_FREQ_44100 |
 			APTX_ADAPTIVE_SAMPLING_FREQ_48000 |
