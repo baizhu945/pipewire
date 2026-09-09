@@ -758,6 +758,22 @@ static int codec_select_config(const struct media_codec *codec, uint32_t flags,
 
 	result = local;
 	adaptive_set_sampling_freq(&result, rate->codec_frequency);
+	/* Diagnostic override: the exact meaning of the Adaptive sampling-rate
+	 * bits is ambiguous across sources (Qualcomm's A2DP-offload parser uses
+	 * 44100=0x08/48000=0x10/88000=0x20/192000=0x40, while the MOMENTUM 5
+	 * capability record looks like a different bit set).  Allow pinning the
+	 * advertised bits without touching the codec rate so every combination
+	 * can be probed. */
+	{
+		const char *fb = getenv("APTX_ADAPTIVE_FREQ_BITS");
+		if (fb != NULL && *fb != '\0') {
+			uint8_t bits = (uint8_t)strtoul(fb, NULL, 0);
+			result.sampling_freq_source_type =
+					(bits & APTX_ADAPTIVE_SAMPLING_FREQ_MASK) |
+					(adaptive_source_type(&result) &
+					 APTX_ADAPTIVE_SOURCE_TYPE_MASK);
+		}
+	}
 	/* The MOMENTUM 5 advertises both STEREO (0x02) and JOINT_STEREO (0x08) but
 	 * only consumes a JOINT_STEREO stream; prefer JOINT_STEREO and keep an
 	 * env override so the choice can be flipped without a rebuild. */
