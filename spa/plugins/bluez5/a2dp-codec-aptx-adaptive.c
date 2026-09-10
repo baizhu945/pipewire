@@ -65,6 +65,18 @@
 /* Upper bound for a single helper reply.  The helper answers in well under a
  * millisecond; this only protects the data thread from a stuck emulator. */
 #define APTX_ADAPTIVE_HELPER_READ_TIMEOUT_MS 1000
+/* The same bound applies to writes.  One PCM block is at most ~18 KiB and the
+ * pipe holds 64 KiB, so a healthy helper never makes the writer wait; without
+ * a deadline a helper that stops reading stdin would block the data thread
+ * forever once the pipe is full. */
+#define APTX_ADAPTIVE_HELPER_WRITE_TIMEOUT_MS 1000
+/* Smallest transport MTU that can carry an ordinary R2 packet: RTP header plus
+ * the 8-byte wrapper plus the 656-byte codec frame.  A smaller MTU cannot
+ * carry the stream at all, so say so instead of dropping every packet. */
+#define APTX_ADAPTIVE_MIN_MTU 700
+/* A staged, self-contained format block is large; keep the helper protocol
+ * from being handed an absurd length. */
+#define APTX_ADAPTIVE_MAX_HELPER_REQUEST (1u << 20)
 
 static int64_t now_ms(void)
 {
@@ -374,10 +386,32 @@ static int read_full(int fd, void *data, size_t size)
 static int write_full(int fd, const void *data, size_t size)
 {
 	const uint8_t *p = data;
+	/* Bound every write with a deadline, exactly like read_full().  A helper
+	 * that stops reading its stdin (stuck emulator, crashed QEMU, a helper
+	 * that is itself blocked writing to a full stdout pipe) would otherwise
+	 * block the PipeWire data thread forever once the pipe buffer is full. */
+	int64_t deadline = now_ms() + APTX_ADAPTIVE_HELPER_WRITE_TIMEOUT_MS;
+
 	while (size > 0) {
-		ssize_t n = write(fd, p, size);
-		if (n < 0) {
+		struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+		int64_t remaining = deadline - now_ms();
+		ssize_t n;
+		int ret;
+
+		if (remaining <= 0)
+			return -ETIMEDOUT;
+		ret = poll(&pfd, 1, (int)SPA_MIN(remaining, (int64_t)INT_MAX));
+		if (ret < 0) {
 			if (errno == EINTR)
+				continue;
+			return -errno;
+		}
+		if (ret == 0)
+			return -ETIMEDOUT;
+
+		n = write(fd, p, size);
+		if (n < 0) {
+			if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
 				continue;
 			return -errno;
 		}
@@ -387,6 +421,23 @@ static int write_full(int fd, const void *data, size_t size)
 		size -= (size_t)n;
 	}
 	return 0;
+}
+
+/* Parse a boolean environment switch.  An unset variable takes the documented
+ * default; an empty value means "yes"; the usual off spellings mean "no".
+ * This exists because the previous code tested getenv() != NULL, so
+ * APTX_ADAPTIVE_STRIP_OTA=0 silently enabled the option instead of disabling
+ * it. */
+static bool env_flag(const char *name, bool fallback)
+{
+	const char *value = getenv(name);
+
+	if (value == NULL)
+		return fallback;
+	if (*value == '\0')
+		return true;
+	return !(spa_streq(value, "0") || spa_streq(value, "no") ||
+			spa_streq(value, "false") || spa_streq(value, "off"));
 }
 
 static uint32_t read_u32le(const uint8_t data[4])
@@ -481,6 +532,9 @@ static pid_t spawn_helper(int *input_fd, int *output_fd)
 		return -1;
 	}
 	if (pid == 0) {
+		sigset_t empty;
+		int fd;
+
 		close(input_pipe[1]);
 		close(output_pipe[0]);
 		if (dup2(input_pipe[0], STDIN_FILENO) < 0 ||
@@ -488,6 +542,16 @@ static pid_t spawn_helper(int *input_fd, int *output_fd)
 			_exit(127);
 		close(input_pipe[0]);
 		close(output_pipe[1]);
+		/* The parent may run with signals blocked (PipeWire blocks SIGINT and
+		 * SIGTERM) and with descriptors that the helper has no business
+		 * holding.  Start from a clean slate so that kill() actually reaches
+		 * the emulator and so that a crashed helper cannot keep a PipeWire
+		 * socket alive.  dup2() above already placed our two pipes. */
+		sigemptyset(&empty);
+		sigprocmask(SIG_SETMASK, &empty, NULL);
+		signal(SIGPIPE, SIG_DFL);
+		for (fd = 3; fd < 1024; ++fd)
+			close(fd);
 		child_set_working_directory(helper);
 
 		if (qemu != NULL)
@@ -511,7 +575,7 @@ static int helper_control(struct impl *this, uint32_t command,
 	uint8_t reply[8];
 	int result;
 
-	if (payload_size > UINT32_MAX)
+	if (payload_size > APTX_ADAPTIVE_MAX_HELPER_REQUEST)
 		return -EOVERFLOW;
 	write_u32le(header, APTX_ADAPTIVE_HELPER_CONTROL);
 	write_u32le(header + 4, command);
@@ -834,11 +898,30 @@ static int codec_select_config(const struct media_codec *codec, uint32_t flags,
 				negotiated_low;
 		/* Diagnostic override: the Android source talking to this host sends
 		 * its own feature word (0x0f000017) rather than this intersection, so
-		 * allow pinning it to find what the sink actually needs. */
+		 * allow pinning it to find what the sink actually needs.  The override
+		 * must not undo the safety rule above: with Lossless disabled the
+		 * R2.2 capability bit makes the wrapper wait for sideband feedback that
+		 * this bridge never sends, which stalls the stream.  Clear it again
+		 * instead of relying on the helper's own backstop. */
 		{
 			const char *fe = getenv("APTX_ADAPTIVE_FEATURES");
-			if (fe != NULL && *fe != '\0')
-				negotiated_features = (uint32_t)strtoul(fe, NULL, 0);
+			if (fe != NULL && *fe != '\0') {
+				uint32_t override = (uint32_t)strtoul(fe, NULL, 0);
+
+				if (!lossless_enabled() &&
+						(override & APTX_ADAPTIVE_R2_2_SUPPORT_CAP) != 0) {
+					override &=
+						~(uint32_t)APTX_ADAPTIVE_R2_2_SUPPORT_CAP;
+					if (log_ != NULL)
+						spa_log_warn(log_,
+							"aptX Adaptive: "
+							"APTX_ADAPTIVE_FEATURES requested the "
+							"R2.2/Lossless bit while Lossless is "
+							"disabled; clearing 0x%02x",
+							APTX_ADAPTIVE_R2_2_SUPPORT_CAP);
+				}
+				negotiated_features = override;
+			}
 		}
 		result.cap_ext_ver_num = APTX_ADAPTIVE_CAP_EXT_VER_NUM;
 		adaptive_write_features(&result, negotiated_features);
@@ -1090,6 +1173,17 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 			spa_log_info(log_,
 					"aptX Adaptive Lossless uses the direct R3 encoding "
 					"pipeline; QHS sideband feedback is not required");
+		if (this->mtu < APTX_ADAPTIVE_MIN_MTU)
+			spa_log_warn(log_,
+					"aptX Adaptive: transport MTU %d cannot carry an "
+					"Adaptive packet (needs at least %d); every packet "
+					"will be dropped",
+					this->mtu, APTX_ADAPTIVE_MIN_MTU);
+		if (this->abr_enabled)
+			spa_log_info(log_,
+					"aptX Adaptive ABR levels are driven by the local "
+					"transport backlog; the controller-side RF/BER "
+					"feedback of the reference stack is not available");
 	}
 
 	/* convert_to_q27() normalises every supported source format to the 32-bit
@@ -1212,6 +1306,11 @@ static int codec_encode(void *data, const void *src, size_t src_size,
 		return -EIO;
 	}
 	if (response_size == 0 || response_size > sizeof(this->packet)) {
+		if (response_size > sizeof(this->packet) && log_ != NULL)
+			spa_log_warn(log_,
+					"aptX Adaptive: helper announced a %u byte packet "
+					"but the buffer holds %zu; dropping it",
+					response_size, sizeof(this->packet));
 		*dst_out = 0;
 		*need_flush = NEED_FLUSH_NO;
 		return this->block_size;
@@ -1230,14 +1329,20 @@ static int codec_encode(void *data, const void *src, size_t src_size,
 	const uint8_t *wire_data = this->packet;
 	size_t wire_size = response_size;
 	if (this->mode == APTX_ADAPTIVE_HELPER_MODE_R2 &&
-			getenv("APTX_ADAPTIVE_STRIP_OTA") != NULL) {
+			env_flag("APTX_ADAPTIVE_STRIP_OTA", false)) {
 		wire_data = payload;
 		wire_size = response_size - (size_t)(payload - this->packet);
 	}
 	/* A2DP sends one complete RTP packet per transport write. */
 	if (this->mtu > 0 && wire_size + APTX_ADAPTIVE_RTP_HEADER_SIZE >
-			(size_t)this->mtu)
+			(size_t)this->mtu) {
+		if (log_ != NULL)
+			spa_log_warn(log_,
+					"aptX Adaptive: dropping a %zu byte packet that "
+					"does not fit the %d byte transport MTU",
+					wire_size, this->mtu);
 		return -EMSGSIZE;
+	}
 	if (wire_size > dst_size)
 		return -ENOSPC;
 
@@ -1250,17 +1355,20 @@ static int codec_encode(void *data, const void *src, size_t src_size,
 static unsigned int abr_level_for_unsent(const struct impl *this, size_t unsent)
 {
 	size_t mtu = this->mtu > 0 ? (size_t)this->mtu : 995u;
-	/* media-sink reports free socket space, so less free space means a lower
-	 * link-quality level. */
+	/* media-sink passes get_transport_unsent_size(): the number of bytes still
+	 * queued in the transport socket (fd_buffer_size - free space).  A larger
+	 * backlog means the link is draining more slowly, which maps to a lower
+	 * quality level.  Levels are 0-based here and become 1-based helper
+	 * quality levels in codec_abr_process(). */
 	if (unsent <= mtu / 2)
-		return 0;
+		return APTX_ADAPTIVE_ABR_LEVELS - 1;
 	if (unsent <= mtu)
-		return 1;
+		return APTX_ADAPTIVE_ABR_LEVELS - 2;
 	if (unsent <= mtu * 2)
-		return 2;
+		return APTX_ADAPTIVE_ABR_LEVELS - 3;
 	if (unsent <= mtu * 3)
-		return 3;
-	return 4;
+		return APTX_ADAPTIVE_ABR_LEVELS - 4;
+	return 0;
 }
 
 static int codec_abr_process(void *data, size_t unsent)
@@ -1311,8 +1419,14 @@ static int codec_abr_process(void *data, size_t unsent)
 static void codec_get_delay(void *data, uint32_t *encoder, uint32_t *decoder)
 {
 	struct impl *this = data;
+
+	/* Units are samples: media-sink converts this into nanoseconds with the
+	 * graph rate.  The encoder cannot emit a sample before its block is
+	 * complete, so one block is genuine latency; LDAC uses the same "one frame"
+	 * convention.  The sink's own buffering arrives through DELAY_REPORT and is
+	 * accounted for by the transport, not here. */
 	if (encoder)
-		*encoder = this->downsample2 ? 7 : 0;
+		*encoder = this->codec_frames + (this->downsample2 ? 7u : 0u);
 	if (decoder)
 		*decoder = 0;
 }
