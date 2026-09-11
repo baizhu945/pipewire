@@ -44,6 +44,7 @@
 #define APTX_ADAPTIVE_LOSSLESS_ENV "APTX_ADAPTIVE_LOSSLESS"
 #define APTX_ADAPTIVE_QHS_ENV "APTX_ADAPTIVE_QHS_SUPPORT"
 #define APTX_ADAPTIVE_ABR_ENV "APTX_ADAPTIVE_ABR"
+#define APTX_ADAPTIVE_ADVERTISE_R2_2_ENV "APTX_ADAPTIVE_ADVERTISE_R2_2"
 
 #define APTX_ADAPTIVE_CHANNELS 2u
 #define APTX_ADAPTIVE_HELPER_BITS_PER_SAMPLE 32u
@@ -315,6 +316,22 @@ static bool get_qhs_supported(void)
 	/* An ordinary host Bluetooth controller does not expose Qualcomm High
 	 * Speed Link.  Require an explicit assertion before AUTO may enter the
 	 * vendor Lossless candidate path. */
+	return value != NULL && (spa_streq(value, "1") ||
+			spa_streq(value, "yes") || spa_streq(value, "true") ||
+			spa_streq(value, "YES") || spa_streq(value, "TRUE"));
+}
+
+static bool get_advertise_r2_2(void)
+{
+	const char *value = getenv(APTX_ADAPTIVE_ADVERTISE_R2_2_ENV);
+
+	/* Report the R2.2 capability to the peer while the encoder keeps running
+	 * its ordinary R2 path.  Every Qualcomm source advertises the capability
+	 * (the phone sends features 0x0f000092), but this bridge must not let the
+	 * proprietary R2.2 wrapper take over the encoder: that state waits for
+	 * QHS/16-bit sideband feedback which a non-Qualcomm controller cannot
+	 * provide, and the stream then stalls.  Keeping the two concerns apart
+	 * makes it possible to test the advertisement on its own. */
 	return value != NULL && (spa_streq(value, "1") ||
 			spa_streq(value, "yes") || spa_streq(value, "true") ||
 			spa_streq(value, "YES") || spa_streq(value, "TRUE"));
@@ -654,6 +671,23 @@ static int initialize_helper(struct impl *this, const uint8_t *codec_config,
 	config.cie_size = APTX_ADAPTIVE_HELPER_CIE_SIZE;
 	memcpy(config.cie, codec_config,
 			SPA_MIN(codec_config_size, sizeof(config.cie)));
+	/* The peer may be told that this source supports R2.2 while the encoder
+	 * must not see that capability: presenting it to the proprietary R2.2
+	 * wrapper makes it wait for QHS/16-bit sideband feedback that a
+	 * non-Qualcomm controller cannot supply, and the stream then stalls.
+	 * The advertisement and the encoder input are therefore prepared from
+	 * two different copies of the same element. */
+	if (get_advertise_r2_2() && !lossless_enabled() &&
+			codec_config_size >= sizeof(a2dp_aptx_adaptive_t)) {
+		a2dp_aptx_adaptive_t encoder_caps;
+		size_t copy = SPA_MIN(sizeof(encoder_caps), sizeof(config.cie));
+
+		memcpy(&encoder_caps, codec_config, sizeof(encoder_caps));
+		adaptive_write_features(&encoder_caps,
+				adaptive_read_features(&encoder_caps) &
+				~(uint32_t)APTX_ADAPTIVE_R2_2_SUPPORT_CAP);
+		memcpy(config.cie, &encoder_caps, copy);
+	}
 	memcpy(config.r2_stream, this->r2_stream, sizeof(config.r2_stream));
 	if ((result = init_r2_stream(config.r2_stream)) < 0)
 		return result;
@@ -765,6 +799,7 @@ static int codec_select_config(const struct media_codec *codec, uint32_t flags,
 	uint32_t negotiated_features;
 	uint8_t negotiated_low;
 	bool peer_supports_r22;
+	bool advertise_r2_2;
 
 	(void)flags;
 	(void)settings;
@@ -801,6 +836,7 @@ static int codec_select_config(const struct media_codec *codec, uint32_t flags,
 	peer_features = adaptive_read_features(&peer);
 	peer_supports_r22 = peer.cap_ext_ver_num == APTX_ADAPTIVE_CAP_EXT_VER_NUM &&
 			(peer_features & APTX_ADAPTIVE_R2_2_SUPPORT_CAP) != 0;
+	advertise_r2_2 = get_advertise_r2_2();
 	if (!peer_supports_r22)
 		local.sampling_freq_source_type &=
 			(uint8_t)~APTX_ADAPTIVE_SAMPLING_FREQ_44100;
@@ -890,8 +926,11 @@ static int codec_select_config(const struct media_codec *codec, uint32_t flags,
 		 * is disabled the bridge must not present it to the encoder: the
 		 * proprietary R2.2 wrapper then enters its Lossless candidate state
 		 * at 44.1 kHz and waits for QHS/16-bit sideband feedback that this
-		 * bridge never sends, which stalls the stream after a few packets. */
-		if (!lossless_enabled())
+		 * bridge never sends, which stalls the stream after a few packets.
+		 * APTX_ADAPTIVE_ADVERTISE_R2_2 keeps the bit in the record the peer
+		 * sees while the encoder still runs its ordinary R2 path, which is
+		 * what a Qualcomm source looks like from the outside. */
+		if (!lossless_enabled() && !advertise_r2_2)
 			negotiated_low &=
 				(uint8_t)~APTX_ADAPTIVE_R2_2_SUPPORT_CAP;
 		negotiated_features = (peer_features & 0xffffff00u) |
@@ -908,7 +947,7 @@ static int codec_select_config(const struct media_codec *codec, uint32_t flags,
 			if (fe != NULL && *fe != '\0') {
 				uint32_t override = (uint32_t)strtoul(fe, NULL, 0);
 
-				if (!lossless_enabled() &&
+				if (!lossless_enabled() && !advertise_r2_2 &&
 						(override & APTX_ADAPTIVE_R2_2_SUPPORT_CAP) != 0) {
 					override &=
 						~(uint32_t)APTX_ADAPTIVE_R2_2_SUPPORT_CAP;
@@ -931,9 +970,11 @@ static int codec_select_config(const struct media_codec *codec, uint32_t flags,
 	if (log_ != NULL)
 		spa_log_info(log_,
 				"aptX Adaptive selected: requested-rate=%u codec-rate=%u "
-				"peer-r22=%d negotiated-channel=0x%02x",
+				"peer-r22=%d negotiated-channel=0x%02x advertise-r22=%d "
+				"lossless-mode=%d",
 				requested_rate, rate->codec_rate, peer_supports_r22,
-				result.channel_mode);
+				result.channel_mode, advertise_r2_2,
+				lossless_enabled() ? 1 : 0);
 	adaptive_log_caps("negotiated configuration", &result);
 	return sizeof(result);
 }
