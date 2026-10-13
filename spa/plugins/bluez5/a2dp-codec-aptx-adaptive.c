@@ -46,6 +46,14 @@
 #define APTX_ADAPTIVE_ABR_ENV "APTX_ADAPTIVE_ABR"
 #define APTX_ADAPTIVE_ADVERTISE_R2_2_ENV "APTX_ADAPTIVE_ADVERTISE_R2_2"
 
+/* Constant-RTP-timestamp mode.  With SOURCE_TYPE_2 the sink runs its own
+ * timing and expects the RTP timestamp to carry the samples per channel in
+ * this packet rather than a running clock; a running timestamp makes such a
+ * sink consume at roughly a third of real time.  Off by default so the
+ * deployed wire format does not change.  Suggested in PR #16 (2026-10-12)
+ * by theacrat, who got audio out of an R1 sink from a Realtek controller. */
+#define APTX_ADAPTIVE_TS_CONSTANT_ENV "APTX_ADAPTIVE_TS_CONSTANT"
+
 #define APTX_ADAPTIVE_CHANNELS 2u
 #define APTX_ADAPTIVE_HELPER_BITS_PER_SAMPLE 32u
 #define APTX_ADAPTIVE_CODEC_FRAMES 672u
@@ -235,6 +243,8 @@ struct impl {
 	uint8_t packet[APTX_ADAPTIVE_MAX_PACKET_SIZE];
 
 	bool abr_enabled;
+	/* RTP timestamp is the packet's samples per channel, not a clock. */
+	bool ts_constant;
 	unsigned int abr_level;
 	unsigned int abr_pending_level;
 	unsigned int abr_pending_count;
@@ -342,6 +352,11 @@ static bool get_abr_enabled(void)
 	const char *value = getenv(APTX_ADAPTIVE_ABR_ENV);
 	return value == NULL || (!spa_streq(value, "0") &&
 			!spa_streq(value, "off") && !spa_streq(value, "OFF"));
+}
+
+static bool get_ts_constant(void)
+{
+	return env_flag(APTX_ADAPTIVE_TS_CONSTANT_ENV, false);
 }
 
 static bool helper_available(void)
@@ -1193,6 +1208,7 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 	this->lossless_mode = get_lossless_mode();
 	this->qhs_supported = get_qhs_supported();
 	this->abr_enabled = get_abr_enabled();
+	this->ts_constant = get_ts_constant();
 	this->block_size = (int)(this->source_frames * APTX_ADAPTIVE_CHANNELS *
 			this->source_bytes);
 	this->abr_level = APTX_ADAPTIVE_ABR_LEVELS - 1;
@@ -1255,11 +1271,17 @@ static int codec_get_block_size(void *data)
 static int codec_start_encode(void *data, void *dst, size_t dst_size,
 		uint16_t seqnum, uint32_t timestamp)
 {
+	struct impl *this = data;
 	struct rtp_header *rtp;
 
-	(void)data;
 	if (dst == NULL || dst_size < sizeof(*rtp))
 		return -ENOSPC;
+
+	/* SOURCE_TYPE_2 sinks do their own timing and read the low 16 bits as
+	 * the packet's samples per channel; the upper 16 bits are a signed
+	 * latency adjustment in milliseconds and stay zero here. */
+	if (this != NULL && this->ts_constant)
+		timestamp = this->source_frames;
 
 	rtp = dst;
 	memset(rtp, 0, sizeof(*rtp));
