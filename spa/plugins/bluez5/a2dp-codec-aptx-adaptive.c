@@ -184,6 +184,14 @@ static void adaptive_set_sampling_freq(a2dp_aptx_adaptive_t *caps,
 			(adaptive_source_type(caps) & APTX_ADAPTIVE_SOURCE_TYPE_MASK);
 }
 
+static uint32_t get_cap_ext_ver(void)
+{
+	const char *value = getenv(APTX_ADAPTIVE_CAP_EXT_VER_ENV);
+
+	return value == NULL ? APTX_ADAPTIVE_CAP_EXT_VER_NUM :
+			(uint32_t)strtoul(value, NULL, 0);
+}
+
 static void adaptive_init_caps(a2dp_aptx_adaptive_t *caps,
 		uint32_t features, uint8_t sampling_freq, uint8_t source_type)
 {
@@ -493,13 +501,6 @@ static uint32_t get_ssrc(void)
 	return value == NULL ? 0 : (uint32_t)strtoul(value, NULL, 0);
 }
 
-static uint32_t get_cap_ext_ver(void)
-{
-	const char *value = getenv(APTX_ADAPTIVE_CAP_EXT_VER_ENV);
-
-	return value == NULL ? APTX_ADAPTIVE_CAP_EXT_VER_NUM :
-			(uint32_t)strtoul(value, NULL, 0);
-}
 
 static uint32_t read_u32le(const uint8_t data[4])
 {
