@@ -354,10 +354,6 @@ static bool get_abr_enabled(void)
 			!spa_streq(value, "off") && !spa_streq(value, "OFF"));
 }
 
-static bool get_ts_constant(void)
-{
-	return env_flag(APTX_ADAPTIVE_TS_CONSTANT_ENV, false);
-}
 
 static bool helper_available(void)
 {
@@ -470,6 +466,11 @@ static bool env_flag(const char *name, bool fallback)
 		return true;
 	return !(spa_streq(value, "0") || spa_streq(value, "no") ||
 			spa_streq(value, "false") || spa_streq(value, "off"));
+}
+
+static bool get_ts_constant(void)
+{
+	return env_flag(APTX_ADAPTIVE_TS_CONSTANT_ENV, false);
 }
 
 static uint32_t read_u32le(const uint8_t data[4])
