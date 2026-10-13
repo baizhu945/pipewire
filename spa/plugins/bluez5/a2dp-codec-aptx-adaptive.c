@@ -60,6 +60,12 @@
  * source runs the software-encoder path, so it has to be testable. */
 #define APTX_ADAPTIVE_SSRC_ENV "APTX_ADAPTIVE_SSRC"
 
+/* Optional cap_ext_ver_num override (0 or 1).  The encoder's packet period
+ * follows the negotiated extension byte; a plain-R2 negotiation (0) is the
+ * only configuration observed to produce a 16 ms period instead of 25 ms, so
+ * it has to be reachable without editing the source. */
+#define APTX_ADAPTIVE_CAP_EXT_VER_ENV "APTX_ADAPTIVE_CAP_EXT_VER"
+
 #define APTX_ADAPTIVE_CHANNELS 2u
 #define APTX_ADAPTIVE_HELPER_BITS_PER_SAMPLE 32u
 #define APTX_ADAPTIVE_CODEC_FRAMES 672u
@@ -196,7 +202,7 @@ static void adaptive_init_caps(a2dp_aptx_adaptive_t *caps,
 	caps->channel_mode = APTX_ADAPTIVE_CHANNEL_MODE_STEREO_SOURCE;
 	memcpy(caps->ttp, adaptive_ttp, sizeof(caps->ttp));
 	caps->reserved_15thbyte = APTX_ADAPTIVE_RESERVED_15THBYTE;
-	caps->cap_ext_ver_num = APTX_ADAPTIVE_CAP_EXT_VER_NUM;
+	caps->cap_ext_ver_num = (uint8_t)get_cap_ext_ver();
 	adaptive_write_features(caps, features);
 	memcpy(caps->setup_pref, adaptive_setup_pref,
 			sizeof(caps->setup_pref));
@@ -485,6 +491,14 @@ static uint32_t get_ssrc(void)
 {
 	const char *value = getenv(APTX_ADAPTIVE_SSRC_ENV);
 	return value == NULL ? 0 : (uint32_t)strtoul(value, NULL, 0);
+}
+
+static uint32_t get_cap_ext_ver(void)
+{
+	const char *value = getenv(APTX_ADAPTIVE_CAP_EXT_VER_ENV);
+
+	return value == NULL ? APTX_ADAPTIVE_CAP_EXT_VER_NUM :
+			(uint32_t)strtoul(value, NULL, 0);
 }
 
 static uint32_t read_u32le(const uint8_t data[4])
@@ -994,6 +1008,16 @@ static int codec_select_config(const struct media_codec *codec, uint32_t flags,
 		}
 		result.cap_ext_ver_num = APTX_ADAPTIVE_CAP_EXT_VER_NUM;
 		adaptive_write_features(&result, negotiated_features);
+	}
+
+	/* A plain-R2 request has to survive the peer's R2.2 advertisement: mirror
+	 * the peer-version-0 branch so the encoder sees the shorter period. */
+	if (get_cap_ext_ver() == 0 && result.cap_ext_ver_num != 0) {
+		result.cap_ext_ver_num = 0;
+		memset(result.supported_features, 0,
+				sizeof(result.supported_features));
+		memset(result.setup_pref, 0, sizeof(result.setup_pref));
+		memset(result.eoc, 0, sizeof(result.eoc));
 	}
 
 	memcpy(config, &result, sizeof(result));
