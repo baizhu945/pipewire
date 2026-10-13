@@ -54,6 +54,12 @@
  * by theacrat, who got audio out of an R1 sink from a Realtek controller. */
 #define APTX_ADAPTIVE_TS_CONSTANT_ENV "APTX_ADAPTIVE_TS_CONSTANT"
 
+/* Optional RTP SSRC override.  The deployed stream keeps SSRC 0 (byte-identical
+ * to what a Snapdragon phone sends), but the sink-side latency mode is believed
+ * to be selected through this field (0xA3 HQ, 0xA1/0xA2 LL, 0xA4 TWS) when the
+ * source runs the software-encoder path, so it has to be testable. */
+#define APTX_ADAPTIVE_SSRC_ENV "APTX_ADAPTIVE_SSRC"
+
 #define APTX_ADAPTIVE_CHANNELS 2u
 #define APTX_ADAPTIVE_HELPER_BITS_PER_SAMPLE 32u
 #define APTX_ADAPTIVE_CODEC_FRAMES 672u
@@ -245,6 +251,8 @@ struct impl {
 	bool abr_enabled;
 	/* RTP timestamp is the packet's samples per channel, not a clock. */
 	bool ts_constant;
+	/* RTP SSRC override; 0 keeps the deployed value. */
+	uint32_t ssrc;
 	unsigned int abr_level;
 	unsigned int abr_pending_level;
 	unsigned int abr_pending_count;
@@ -471,6 +479,12 @@ static bool env_flag(const char *name, bool fallback)
 static bool get_ts_constant(void)
 {
 	return env_flag(APTX_ADAPTIVE_TS_CONSTANT_ENV, false);
+}
+
+static uint32_t get_ssrc(void)
+{
+	const char *value = getenv(APTX_ADAPTIVE_SSRC_ENV);
+	return value == NULL ? 0 : (uint32_t)strtoul(value, NULL, 0);
 }
 
 static uint32_t read_u32le(const uint8_t data[4])
@@ -1210,6 +1224,7 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 	this->qhs_supported = get_qhs_supported();
 	this->abr_enabled = get_abr_enabled();
 	this->ts_constant = get_ts_constant();
+	this->ssrc = get_ssrc();
 	this->block_size = (int)(this->source_frames * APTX_ADAPTIVE_CHANNELS *
 			this->source_bytes);
 	this->abr_level = APTX_ADAPTIVE_ABR_LEVELS - 1;
@@ -1290,6 +1305,8 @@ static int codec_start_encode(void *data, void *dst, size_t dst_size,
 	rtp->pt = 96;
 	rtp->sequence_number = htons(seqnum);
 	rtp->timestamp = htonl(timestamp);
+	if (this != NULL && this->ssrc != 0)
+		rtp->ssrc = htonl(this->ssrc);
 	return sizeof(*rtp);
 }
 
